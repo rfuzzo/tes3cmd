@@ -1,18 +1,91 @@
 #!/usr/bin/perl
 BEGIN {
-    $::VERSION = "0.40-PRE-RELEASE-2";
+	$::VERSION = "0.37x";
 }
-
 # tes3cmd: command line tool to do various hacks with TES3 plugins
-# Copyright 2016 by John Moonsugar
-# Distributed as part of the tes3cmd project:
-#   https://github.com/john-moonsugar/tes3cmd/
+# Copyright 2012 by John Moonsugar
+# Distributed as part of the mlox project:
+#   http://code.google.com/p/mlox/
 # under the MIT License:
-#   https://github.com/john-moonsugar/tes3cmd/blob/master/LICENSE
+#   http://code.google.com/p/mlox/source/browse/trunk/License.txt
 # Documentation:
-#   https://github.com/john-moonsugar/tes3cmd/wiki
+#   http://code.google.com/p/mlox/wiki/Tes3cmd
 # to build on Windows with Par::Packer
 # pp -o tes3cmd.exe tes3cmd
+
+# modify --replace needs a way to specify first replacement only (override default global replace)
+# change default backup strategy to stash in tes3cmd/Backups
+# field name inputs should be automatically lowercased so they match correctly.
+# delete should support sub-record groups. (what do with MVRF ???)
+#
+#add ability to dump with things splitted out into individual files --output-folder
+#add: convertdeletedtodisabled command
+#add "report" function with csv/tab delimited output and format specifiers (plus --unused, etc)
+#dump needs to be able to show object type.
+#dump could highlight which skills a trainer trains in (top 3)
+# - check that re-dating of cleaned (synced?) plugins works correctly on XP.
+# "recover" needs to detect overwritten length fields, perhaps by backing up 1 record to previous good record start, and scan from there
+# savegame cleaner: reset NPC heads/hair (recapitate)
+# improve corrupted INFO (mwedit) detection, and possibly clean them
+# when dumping NPC_, read FACT to set up FACTION data hashes (need to read all plugins and cache this data) (Check CS)
+# implement a "repack" command: bsaunpack + tesfiles/resourcecheck + clean
+# TES3::File (open_for_input, backup, etc)?
+# implement proper verbosity
+# check if unnecessary backups are made during fixit
+# cleanup .tmp if die
+# clean would be sped up if command added a "clean <size>" mark to plugin (use unused space in header?)
+#    but it would probably not be good to change size of masters, at least.
+# GUI
+# add tes3spell after GUI
+# reformat overdial output? just list each topic once, with list of plugins that have it
+# implement script compiler
+# # # # # # # # # # # # # # #
+# add new commands:
+# * quest - dump INFO/SCPT records relevent to a quest, in quest order, pretty-printed
+# * extract - dump subset of records by following dependencies
+# * "gen-res" (generate resources catalog cells) poop out an esp that displays matching objects in various cells:
+#      # put all mold cave static pieces in a test cell named "Mold Cave" and all guard NPCs in a cell named "Guards"
+#      # maybe also specify distance between objects in generated cell
+#      tes3cmd genres --resource "/Guards/npc_/class:guard/" --resource "/Mold Cave/stat/^in_mold/" --plugin my_resources.esp *.esm
+# * bsa: --add/--remove/--list
+# * "sos" (save our save) or "bisect" for doing a binary search for bad records/subrecords in a savegame
+# * "buildcache" (build up all the cache files for cleaning, lookups, etc)
+# * "codec" (print text description of TES3 codec)
+# * "undo" (revert to last backups for modifying commands)
+# * "tidy" (remove cache and undo stuff)
+# * "undump" (canonical text to record, can't undump from wrong version)
+# * "combine" (merge listed plugins into one plugin)
+# * "conflict" (detailed report, toggle mergeable records from report)
+# # # # # # # # # # # # # # #
+# * "multipatch", to include:
+# ** automatically patch overdial problems?
+# ** generate book rotate scripts (need compiler)
+# ** generate multimark scripts (need compiler)
+# ** gmst/global tweaks: (timescale, fCombatAngleXY)
+# ** import faces/hairs (avoid conflicts by dropping rest of object definition)
+# ** merge objects
+# *** Notes: pre-scan for mergeable objects, save to cache file (foreach plugin save ID,record_offset)
+#            only read mergeable objects into memory (in load order) if defined in more than 2 plugins
+# *** Object Merge Gotchas
+# **** autocalced vs. non-autocalced NPCs NPDT
+# **** deleted body parts from clothes (redefining the set of body parts for a CLOT) (grouped subrecs)
+# **** handle patch plugins that are *supposed* to only override the patchee (auto-detect?)
+# # # # # # # # # # # # # # #
+# lint:
+# * check for possible doubling: objects with nearly the same coordinates/angles
+# * check references with extremely high coordinates
+# * pathgrid points at x=0,y=0,z=0 (nconn==0 is better)
+# * MVRFs in .esm files
+# * check for dialog edits that lose part of the filter.
+# * add note about creating a shortcut on Windows
+# * check for addtopic of non-existant dialog topics?
+# * add a check for missing icons, etc.?
+# * add a check for signrotate contamination (difficult to impossible)
+# * OVR-REC specials: PGRD.?
+# * check for use of == on floats in scripts! (gamehour)
+# * Check for accidental conversion of float to short (putting getsecondspassed into short truncates)
+# * duplicate records should also check for change in flags!
+# * Check for scripts that are saved but not compiled.
 
 BEGIN {
     use constant DBG => grep(/^(?:-d|-?-debug)$/, @ARGV);
@@ -31,32 +104,31 @@ use Getopt::Long qw(:config auto_abbrev);
 use Data::Dumper;
 use Storable;
 use Cwd;
+use Config::IniFiles;
 use strict;
 use warnings;
 
 my $R;				# current record for modify command
 
 our $CURRENT_PLUGIN = '';
-our $MWDIR;			# Where Morrowind is installed
-our $DATADIR;			# where "Data Files" lives ($MWDIR/Data Files)
-our $TES3CMD_DIR;		# tes3cmd directory ($MWDIR/tes3cmd)
-our $CACHE_DIR;			# cache directory ($MWDIR/tes3cmd/cache)
+our $DATADIR;;	       # where "Data Files" lives.
+our $TES3CMD_DIR;;     # tes3cmd directory under "Data Files" (for cache, ...)
 
 ### MAIN COMMON COMMAND OPTIONS
-our @STDOPT = ("assert", "debug", "output=s", "verbose"); # options for all commands
-our @MODOPT = ("backup-dir=s", "hide-backups"); # options for commands that modify
-our $opt_active;				# limit processing to active plugins
-our $opt_output;				# specify output (default is STDOUT)
-our $opt_backup_dir;		# default value gets set in find_morrowind()
-our $opt_exterior;		# select only exterior cells
+our @STDOPT = (qw(assert debug verbose));
+our @MODOPT = ("backup-dir=s", "hide-backups");
+our $opt_backup_dir;		# default value gets set in find_datadir()
+our $opt_exterior;
 our $opt_hide_backups;
 our $opt_instance_type;		# show types for object instances
 our $opt_instance_match;
 our $opt_instance_no_match;
 our $opt_interior;
 our $opt_list;
+our $opt_match;
 our $opt_no_banner;
 our $opt_no_cache;
+our $opt_no_match;
 our $opt_output_dir;
 our $opt_overwrite;
 our $opt_report_only;
@@ -67,8 +139,6 @@ our @opt_exact_id = ();
 our @opt_flag;
 our @opt_id = ();
 our @opt_ignore_plugin = ();
-our @opt_match;
-our @opt_no_match;
 our @opt_type = ();
 
 ### MAIN COMMAND OPTIONS
@@ -88,15 +158,10 @@ our $opt_diff_2_not_1;
 our $opt_diff_equal;
 our $opt_diff_not_equal;
 our $opt_diff_types;
-our $opt_diff_sortsubrecs;
 
-our @opt_dump_format;
-our $opt_dump_no_quote;
-our $opt_dump_raw;		# OBSOLETE
-our $opt_dump_raw_with_header;	# OBSOLETE
-our $opt_dump_binary;
-our $opt_dump_header;
 our $opt_dump_wrap;
+our $opt_dump_raw;
+our $opt_dump_raw_with_header;
 
 our $opt_header_author = '';
 our $opt_header_description = '';
@@ -136,33 +201,19 @@ our $opt_lint_scripted_doors;
 
 our $opt_modify_program_file = '';
 our $opt_modify_replace = '';
-our $opt_modify_replacefirst = '';
 our $opt_modify_run = '';
-
-our $opt_run_program_file = '';
 
 our $opt_multipatch_cellnames;
 our $opt_multipatch_fogbug;
-our $opt_multipatch_merge_objects;
 our $opt_multipatch_merge_lists;
 our $opt_multipatch_no_activate;
 our $opt_multipatch_summons_persist;
-our @opt_multipatch_delete_creature;
-our @opt_multipatch_delete_item;
 
 our $opt_overdial_single;
 
 our $opt_testcodec_continue;
 our $opt_testcodec_ignore_cruft;
 our @opt_testcodec_exclude_type = ();
-
-### Global wanted record selectors, set in get_wanted() and rec_match()
-our $WANTED_IDS;
-our $WANTED_TYPES;
-our $WANTED_FLAGS;
-
-# misc globals
-our %STATS;
 
 ### CLASS: Util
 
@@ -178,7 +229,7 @@ BEGIN {
 
     use Exporter ();
     our @ISA = qw(Exporter);
-    our @EXPORT_OK = qw(abort assert err dbg prn msg msgonce list_files mkpath sort_by_date RELOAD);
+    our @EXPORT_OK = qw(abort assert err dbg prn msg list_files mkpath sort_by_date RELOAD);
     our %EXPORT_TAGS = ( FIELDS => [ @EXPORT_OK ] );
 }
 
@@ -187,11 +238,6 @@ use constant RELOAD => 1;	# tell methods not to use cached data
 sub err { warn "[ERROR ($CURRENT_PLUGIN): @_]\n"; }
 sub dbg { warn "[DEBUG ($CURRENT_PLUGIN): @_]\n"; }
 sub msg { warn "@_\n"; }
-my %ONE_TIME_MESSAGE;
-sub msgonce {
-    warn "@_\n" unless (defined($ONE_TIME_MESSAGE{@_}));
-    $ONE_TIME_MESSAGE{@_}++;
-}
 sub prn { print "@_\n"; }
 sub assert { my($bool, $msg) = @_; Carp::confess("Assertion Failed: $msg") unless ($bool); }
 sub abort {
@@ -200,11 +246,11 @@ sub abort {
     if ($^O =~ /^MSWin/) {
 	if ($msg =~ /permission denied/i) {
 	    $diagnosis =<<END
-Permission errors may occur in recent versions of Windows OS (since Vista) due to
+Permission errors may occur in recent versions of Windows (since Vista) due to
 the UAC feature and new protected nature of "Program Files". The ideal
 solution is to install Morrowind some place other than "Program Files", such
-as "C:\\Games\\Morrowind". Some choose to disable UAC, but that is not 
-recommended as it is less secure.
+as "C:\\Games\\Morrowind". You can also try disabling UAC, although may make your
+system less secure.
 END
 	}
     }
@@ -239,9 +285,9 @@ sub mkpath {
     my($path, $perms_in) = @_;
     dbg(qq{Creating Path: "$path" with permissions: $perms_in}) if (DBG);
     my $perms = $perms_in || 0755;
-    my $dir = "";
+    my $dir = ($path =~ m!^/!) ? "" : ".";
     foreach my $name (split(m!/!, $path)) {
-	$dir .= "$name/";
+    $dir = "$dir/$name";
 	unless (-d $dir) {
 	    unless (mkdir($dir, $perms)) {
 		print STDERR qq{mkpath(): Error creating "$dir" ($!)\n};
@@ -253,7 +299,6 @@ sub mkpath {
 }
 
 # sort list of files by their modification date
-# TBD - assume @files can have directories
 sub sort_by_date {
     my($dir, @files) = @_;
     my $dirlist = list_files($dir);
@@ -271,7 +316,7 @@ BEGIN {
     use constant DBG => grep(/^(?:-d|-?-debug)$/, @ARGV);
     use constant ASSERT => grep(/^-?-assert$/, @ARGV);
     use constant VERBOSE => (DBG or grep(/^(?:-v|-?-verbose)$/, @ARGV)); # debug turns on verbosity
-    Util->import(qw(abort assert dbg err msg msgonce prn list_files sort_by_date));
+    Util->import(qw(abort assert dbg err msg prn list_files sort_by_date));
 }
 
 
@@ -280,19 +325,18 @@ BEGIN {
 # assuming the program is run somewhere under the Morrowind game directory, find the
 # location of the "Data Files" directory by walking up the hierarchy. Then create
 # TES3CMD_DIR if it does not already exist.
-# since find_morrowind() sets some global option ($opt_) defaults, run it before GetOptions()
-sub find_morrowind {
+# since find_datadir() sets some global option ($opt_) defaults, run it before GetOptions()
+sub find_datadir {
     return($DATADIR) if (defined($DATADIR));
-    my $dir = $ENV{PWD} || Cwd::getcwd; # TBD: check this works on Windows
+    my $dir = Cwd::getcwd;
     abort(qq{Current working directory does not exist: "$dir"}) unless (defined $dir);
     dbg(qq{Checking for data dir in: "$dir"}) if (DBG);
     while (-d $dir) {
-	dbg(qq{Checking for Morrowind home in: "$dir"}) if (DBG);
+    dbg(qq{Checking for MWHOME in: "$dir"}) if (DBG);
 	my $datadir = list_files($dir)->{"data files"};
 	my $mwini = list_files($dir)->{"morrowind.ini"};
 	if ($datadir and $mwini) {
-	    $MWDIR = $dir;
-	    $DATADIR = "$MWDIR/$datadir";
+        $DATADIR = "$dir/$datadir";
 	    msg(qq{DATADIR = "$DATADIR"}) if (VERBOSE);
 	    last;
 	}
@@ -301,28 +345,12 @@ sub find_morrowind {
 	$dir = join("/", @parts);
 	dbg(qq{Checking for "Data Files" in: "$dir"}) if (DBG);
     }
-    if (defined $MWDIR) {
-	$TES3CMD_DIR = "$MWDIR/tes3cmd";
-	$CACHE_DIR = "$MWDIR/tes3cmd/cache";
-	unless (-d $CACHE_DIR) {
-	    Util::mkpath($CACHE_DIR, 0755) or
-		  abort(qq{Unable to make directory: "$CACHE_DIR" ($!)});
-	}
-	# TBD: remove this post release of v0.40!!!
-	my $oldcachefiles = list_files($TES3CMD_DIR);
-	foreach my $oldcache (keys %$oldcachefiles) {
-	    if ($oldcache =~ /\.cache$/ and
-		-f "$TES3CMD_DIR/$oldcache") {
-		msg(qq{[Note: Removing obsolete cache file: "$TES3CMD_DIR/$oldcache"]});
-		unlink("$TES3CMD_DIR/$oldcache");
-	    }
-	}
+    if (defined $DATADIR) {
+    $TES3CMD_DIR = "$DATADIR/tes3cmd";
     } else {
 	msg(qq{WARNING: Can't find "Data Files" directory, functionality reduced. You should first cd (change directory) to somewhere under where Morrowind is installed.});
-	$MWDIR = '.';
 	$DATADIR = '.';		# not running under morrowind directory
 	$TES3CMD_DIR = '.';
-	$CACHE_DIR = '.';
 	$opt_no_cache = 1;	# don't know where MW stuff is, turn off caching
     }
     prn qq{<DATADIR> is "$DATADIR"} if (VERBOSE);
@@ -333,12 +361,8 @@ sub find_morrowind {
 	mkdir($TES3CMD_DIR, 0755) or
 	    abort(qq{Unable to make directory: "$TES3CMD_DIR" ($!)});
     }
-    if (-d "$DATADIR/tes3cmd") {
-	msg(qq{[Found old version of tes3cmd directory: $DATADIR/tes3cmd]});
-	msg(qq{[This old version can be safely removed. New version is now one level up.]});
-    }
-    $opt_backup_dir = "$TES3CMD_DIR/backups"; # TBD: check how we do default during init!
-} # find_morrowind
+    $opt_backup_dir = "$TES3CMD_DIR/backups";
+} # find_datadir
 
 BEGIN {
     # print DEBUG banner
@@ -382,66 +406,16 @@ sub datafile {
 sub ini_file {
     my($self, $reload) = @_;
     return($self->{ini_file})
-	if (defined($self->{ini_file} and not $reload));
-    my $mwfiles = list_files($MWDIR);
+    if (defined($self->{ini_file} and not $reload));
+    my $mwdir = $DATADIR;
+    $mwdir =~ s![\\/]data files.*!!i;
+    abort(qq{ini_file(): Error finding Morrowind directory from "$DATADIR"})
+    if (not -d $mwdir);
+    my $mwfiles = list_files($mwdir);
     my $mwinifile = $mwfiles->{'morrowind.ini'};
-    abort(qq{ini_file(): Error finding "$mwinifile" in "$MWDIR"})
-	if (not -f "$MWDIR/$mwinifile");
-    return($self->{ini_file} = "$MWDIR/$mwinifile");
-}
-
-sub read_gamefiles {
-    my($self) = @_;
-    my $mwini = $self->ini_file;
-    my @gamefiles = ();
-    open(INI, "<", $mwini) or abort(qq{opening "$mwini" for input ($!)});
-    binmode(INI, ':crlf');
-    dbg(qq{Opened "$mwini" for Input\n}) if (DBG);
-    while (<INI>) {
-	last if (/^\[Game Files\]/i);
-    }
-    while (<INI>) {
-	chomp;
-	if (/^GameFile\d+=(.+)/) {
-	    push(@gamefiles, $1);
-	} elsif (/^\[.+\]/) {
-	    last;
-	}
-    }
-    close(INI);
-    return(\@gamefiles);
-}
-
-sub write_gamefiles {
-    my($self, $gamefiles) = @_;
-    my $mwini = $self->ini_file;
-    my $tmpini = qq{${mwini}.tmp};
-    open(INI, "<", $mwini) or abort(qq{opening "$mwini" for input ($!)});
-    binmode(INI, ':crlf');
-    open(TMP, ">", "$tmpini") or abort(qq{opening "$tmpini" for output ($!)});
-    binmode(TMP, ':crlf');
-    while (<INI>) {		# just copy ini file up to [Game Files] section
-	print TMP;
-	last if (/^\[Game Files\]/i);
-    }
-    my $i=0;
-    foreach my $gamefile (@$gamefiles) { # write new gamefiles section
-	print TMP "GameFile$i=$gamefile\n";
-	$i++;
-    }
-    while (<INI>) {		# skip old gamefiles section
-	if (/^\[.*\]/i) {
-	    print TMP;
-	    last;
-	}
-    }
-    while (<INI>) {		# copy anything after gamefiles section
-	print TMP $_;
-    }
-    close(INI);
-    close(TMP);
-    rename($mwini, "$mwini.old") or abort(qq{Error renaming "$mwini" to "$mwini.old" ($!)});
-    rename($tmpini, $mwini) or abort(qq{Error renaming "$tmpini" to "$mwini" ($!)});
+    abort(qq{ini_file(): Error finding "$mwinifile" in "$mwdir"})
+    if (not -f "$mwdir/$mwinifile");
+    return($self->{ini_file} = "$mwdir/$mwinifile");
 }
 
 sub load_order {
@@ -449,15 +423,20 @@ sub load_order {
     return(@{$self->{load_order}})
 	if (defined($self->{load_order} and not $reload));
     abort("DATADIR not defined") unless (defined($DATADIR));
-    my $gamefiles = $self->read_gamefiles();
+    my $mwinipath = $self->ini_file;
+    my $ini = Config::IniFiles->new( -file => $mwinipath );
+    if (not defined $ini) {
+    abort(qq{Config::IniFiles encountered errors in "$mwinipath": @Config::IniFiles::errors});
+    }
     my @active;
-    foreach my $plugin (@$gamefiles) {
-	if ($self->datafile($plugin)) {
-	    dbg(qq{Found Gamefile: "$plugin"}) if (DBG);
-	    push(@active, $plugin);
-	} else {
-	    dbg(qq{MISSING Gamefile: "$plugin"}) if (DBG);
-	}
+    foreach my $param ($ini->Parameters('Game Files')) {
+    my $plugin = $ini->val('Game Files', $param);
+    if ($self->datafile($plugin)) {
+        dbg(qq{Found Gamefile: "$plugin"}) if (DBG);
+        push(@active, $plugin);
+    } else {
+        dbg(qq{MISSING Gamefile: "$1"}) if (DBG);
+    }
     }
     my @sorted = sort_by_date($DATADIR, @active);
     return(@{$self->{load_order} = [grep(/\.esm$/i, @sorted), grep(/\.esp$/i, @sorted)]});
@@ -474,7 +453,6 @@ our $HDR_DESC_LENGTH = 256;
 
 ### SYMBOLIC NAMES FOR FIELD VALUES
 
-# The flags field of the AIDT subrecord is for SERVICES offered by this actor
 our %AIDT_FLAGS =
     ("weapon" => 0x00001,
      "armor" => 0x00002,
@@ -810,7 +788,7 @@ our %INFO_FUN =
      '2X' => "Compare_Global",
      '3X' => "Compare_Local",
      'sX' => "Variable_Compare",
-     "\000\000" => "\n\tERROR: Corrupted INFO! - did you edit with MWEdit? Try resaving with the Construction Set\n\t",
+     '\00' => "\n\tERROR: Corrupted INFO! - did you edit with MWEdit? Try resaving with the Construction Set\n\t",
     );
 
 our %INFO_SCVR_CMP =
@@ -871,7 +849,8 @@ our %NPC_FLAGS =
     ("female" => 0x0001,
      "essential" => 0x0002,
      "respawn" => 0x0004,
-     #"FLAG-8" => 0x0008, #unused ???
+     "FLAG-8" => 0x0008, #unused ???
+     #"persistent" => 0x0008, #fixed? nope /abot
      "autocalc" => 0x0010,
      "blood_skel" => 0x0400,
      "blood_metal" => 0x0800);
@@ -963,7 +942,7 @@ our %SKILL_ACTIONS =
      22 => [qw(Successful_Attack)],		 # Short Blade
      23 => [qw(Successful_Attack)],		 # Marksman
      24 => [qw(Successful_Bargain Successful_Bribe)],	  # Mercantile
-     25 => [qw(Cuccessful_Persuasion Failed_Persuasion)], # Speechcraft
+     25 => [qw(Successful_Persuasion Failed_Persuasion)], # Speechcraft
      26 => [qw(Successful_Attack)]);		 # Hand to Hand
 
 our %SNDG_DATA =
@@ -1184,19 +1163,19 @@ BEGIN {
     use constant ASSERT => grep(/^-?-assert$/, @ARGV);
     use constant WRAP => grep(/^-?-wrap$/, @ARGV);
     use constant VERBOSE => (DBG or grep(/^(?:-v|-?-verbose)$/, @ARGV)); # debug turns on verbosity
-    Util->import(qw(abort assert dbg err msg msgonce prn));
+    Util->import(qw(abort assert dbg err msg prn));
 }
 use Text::Wrap qw(wrap);
 use Data::Dumper;
 use strict;
 
-our $CODEC_VERSION = "0.3";
+our $CODEC_VERSION = "0.2";
 our $MARGIN = "  ";
 our $GROUPMARGIN = " *";
 our $CURRENT_DIAL;
 our $CURRENT_GROUP;
-#our %FACTION_INDEX;
-#our $FACT_I = 0;
+our %FACTION_INDEX;
+our $FACT_I = 0;
 our %FACTION_RANK;
 our %RECTYPES;
 
@@ -1205,6 +1184,7 @@ our %RECTYPES;
 sub unknown_data {
     my($buf) = @_;
     my $len = length($buf);
+    assert($len > 0, "Unknown buffer is NULL!") if (ASSERT);
     if ($len > 4) {
 	my $sep = ($len < 25) ? "  " : "\n\t";
 	(my $tmp = $buf) =~ tr/\000-\037\177-\377//d;
@@ -1219,10 +1199,8 @@ sub unknown_data {
 	my(@chars) = unpack("c*", $buf);
 	return(sprintf(qq{[UNKNOWN_BYTES: 0x%s (${[join(", ",map{"%d"}@chars)]})]},
 		       unpack("H*", $buf), @chars));
-    } elsif ($len == 1) {
-	return(sprintf(qq{[UNKNOWN_BYTE: 0x%s (%d)]}, unpack("H*", $buf), unpack("c", $buf)));
     } else {
-	return("UNKNOWN_NULL: (received zero length buffer)");
+	return(sprintf(qq{[UNKNOWN_BYTE: 0x%s (%d)]}, unpack("H*", $buf), unpack("c", $buf)));
     }
 }
 
@@ -1250,19 +1228,21 @@ my @RD_reference =
 my @RD_float_array_ess =
     ([], { decode => sub {
 	       my($self, $buff) = @_;
+	       my $i = 0;
 	       $self->{_subbuf_} = $buff;
-	       $self->{_array_} = [unpack("f*", $buff)];
+           $self->{$i++} = $_ foreach (unpack("f*", $buff));
+           $self->{_last_idx} = $i - 1;
 	       return($self);
 	   },
 	   encode => sub {
 	       my($self) = @_;
-	       $self->{_subbuf_} = pack("f*", @{$self->{_array_}});
+           $self->{_subbuf_} = pack("f*", map { $self->{$_} } (0..$self->{_last_idx}));
 	       return($self);
 	   },
 	   #fieldnames => sub { (0..$_[0]->{_last_idx}); }, # NOTYET (and implement ordering)
 	   tostr => sub {
 	       my($self) = @_;
-	       "Float_Array: " . join(", ", map { sprintf("$_=%0.2f", $_) } @{$self->{_array_}});
+	       "Float_Array: " . join(", ", map { sprintf("$_=%0.2f", $self->{$_}) } 0..$self->{_last_idx});
 	   },
 	   rdflags => [qw(ess)]});
 
@@ -1270,18 +1250,20 @@ my @RD_long_array_ess =
     ([], { decode => sub {
 	       my($self, $buff) = @_;
 	       $self->{_subbuf_} = $buff;
-	       $self->{_array_} = [unpack("l*", $buff)];
+        my $i = 0;
+	       $self->{$i++} = $_ foreach (unpack("l*", $buff));
+	       $self->{_last_idx} = $i - 1;
 	       return($self);
 	   },
 	   encode => sub {
 	       my($self) = @_;
-	       $self->{_subbuf_} = pack("l*", @{$self->{_array_}});
+	       $self->{_subbuf_} = pack("l*", map { $self->{$_} } (0..$self->{_last_idx}));
 	       return($self);
 	   },
 	   #fieldnames => sub { (0..$_[0]->{_last_idx}); }, # NOTYET (and implement ordering)
 	   tostr => sub {
 	       my($self) = @_;
-	       "Long_Array: " . join(", ", @{$self->{_array_}});
+	       "Long_Array: " . join(", ", map { "$_=$self->{$_}" } 0..$self->{_last_idx});
 	   },
 	   rdflags => [qw(ess)]});
 
@@ -1289,18 +1271,20 @@ my @RD_short_array_ess =
     ([], { decode => sub {
 	       my($self, $buff) = @_;
 	       $self->{_subbuf_} = $buff;
-	       $self->{_array_} = [unpack("s*", $buff)];
+	       my $i = 0;
+	       $self->{$i++} = $_ foreach (unpack("s*", $buff));
+	       $self->{_last_idx} = $i - 1;
 	       return($self);
 	   },
 	   encode => sub {
 	       my($self) = @_;
-	       $self->{_subbuf_} = pack("s*", @{$self->{_array_}});
+	       $self->{_subbuf_} = pack("s*", map { $self->{$_} } (0..$self->{_last_idx}));
 	       return($self);
 	   },
 	   #fieldnames => sub { (0..$_[0]->{_last_idx}); }, # NOTYET (and implement ordering)
 	   tostr => sub {
 	       my($self) = @_;
-	       "Short_Array: " . join(", ", @{$self->{_array_}});
+	       "Short_Array: " . join(", ", map { "$_=$self->{$_}" } 0..$self->{_last_idx});
 	   },
 	   rdflags => [qw(ess)]});
 
@@ -1313,40 +1297,38 @@ my @RD_widx = ([["equipped_index", "l"], # JMS index into NPCO inventory items o
 		 },
 	       });
 
-
-# Note: fieldnames that end in "_#" will get an automatically generated suffix_index
-my @RD_AI_Activate = ([["target_id", ["Z32", "a32"]], ["unknown_#", "C"]]);
-my @RD_AI_Travel = ([["x", "f"], ["y", "f"], ["z", "f"], ["unknown_#", "l"]]); # unknown is some sort of flags ???
-my @RD_AI_Escort = ([["x", "l"], ["y", "l"], ["z", "l"], ["duration", "S"], ["target_id", ["Z32", "a32"]], ["unknown_#", "S"]]);
+my @RD_AI_Activate = ([["target_id", ["Z32", "a32"]], ["unknown_1", "C"]]);
+my @RD_AI_Travel = ([["x", "f"], ["y", "f"], ["z", "f"], ["unknown_1", "l"]]); # unknown is some sort of flags ???
+my @RD_AI_Escort = ([["x", "l"], ["y", "l"], ["z", "l"], ["duration", "S"], ["target_id", ["Z32", "a32"]], ["unknown_1", "S"]]);
 my @RD_AI_Follow = @RD_AI_Escort;
-my @RD_AI_Wander_CREA = ([["distance", "S"], ["duration", "C"], ["time_of_day", "C"], ["unknown_#", "C"], 
+my @RD_AI_Wander_CREA = ([["distance", "S"], ["duration", "C"], ["time_of_day", "C"], ["unknown_1", "C"],
 			  ["idle_2", "C"], ["idle_3", "C"], ["idle_4", "C"], ["idle_5", "C"], ["idle_6", "C"], ["idle_7", "C"], ["idle_8", "C"], ["idle_9", "C"],
-			  ["unknown_#", "C"]], { columns => 4 });
+			  ["unknown_1", "C"]], { columns => 4 });
 my @RD_AI_Wander_NPC = ([["distance", "S"], ["duration", "S"], ["time_of_day", "C"],
 			 ["idle_2", "C"], ["idle_3", "C"], ["idle_4", "C"], ["idle_5", "C"], ["idle_6", "C"], ["idle_7", "C"], ["idle_8", "C"], ["idle_9", "C"],
-			 ["unknown_#", "C"]], { columns => 3 });
+			 ["unknown_1", "C"]], { columns => 3 });
 
 my $RD_Actor_Data =
 #     Field                              Offset
-    [(["unknown_#", "l"],	       #   0
-      ["unknown_#", "l"],	       #   4
-      ["unknown_#", "l"],	       #   8
-      ["unknown_#", "l"],	       #  12
-      ["unknown_#", "f:%f\n\t"],       #  16
+    [(["unknown_1", "l"],          #   0
+      ["unknown_1", "l"],	       #   4
+      ["unknown_1", "l"],	       #   8
+      ["unknown_1", "l"],	       #  12
+      ["unknown_1", "f:%f\n\t"],       #  16
       ["x?", "f"],	       #  20
       ["y?", "f"],	       #  24
       ["z?", "f"],	       #  28
-      ["unknown_#", "l"],	       #  32
-      ["unknown_#", "l:%d\n\t"],       #  36
+      ["unknown_1", "l"],	       #  32
+      ["unknown_1", "l:%d\n\t"],       #  36
       ["health", "f"],		       #  40
       ["max_health", "f"],	       #  44
       ["fatigue", "f"],		       #  48
       ["max_fatigue", "f:%0.2f\n\t"],  #  52
-      ["unknown_#", "f"],	       #  56
-      ["unknown_#", "f"],	       #  60
-      ["unknown_#", "f"],	       #  64
-      ["unknown_#", "f"],	       #  68
-      ["unknown_#", "f:%0.2f\n\t"],    #  72
+      ["unknown_1", "f"],	       #  56
+      ["unknown_1", "f"],	       #  60
+      ["unknown_1", "f"],	       #  64
+      ["unknown_1", "f"],	       #  68
+      ["unknown_1", "f:%0.2f\n\t"],    #  72
       ["encumbrance", "f"],	       #  76
       ["str", "f"],		       #  80
       ["str_base", "f"],	       #  84
@@ -1367,16 +1349,16 @@ my $RD_Actor_Data =
       ["fortify_attack", "L"],	       # 144
       ["sanctuary", "L"],	       # 148
       ["resist_magicka", "C"],	       # 152
-      ["unknown_#", "H6:%s\n\t"],
+      ["unknown_1", "H6:%s\n\t"],
       ["resist_fire", "C"],	# 156 (+ Fire Shield)
-      ["unknown_#", "H6"],
+      ["unknown_1", "H6"],
       ["resist_frost", "C"],	# 160 (+ Frost Shield)
-      ["unknown_#", "H6:%s\n\t"],
+      ["unknown_1", "H6:%s\n\t"],
       ["resist_shock", "C"],	# 164 (+ Lightning Shield)
-      ["unknown_#", "H6"],
+      ["unknown_1", "H6"],
       ["resist_common_disease", "L"],		   # 168
-      ["unknown_#", "L:%d\n\t"],		   # 172
-      ["unknown_#", "L"],			   # 176
+      ["unknown_1", "L:%d\n\t"],		   # 172
+      ["unknown_1", "L"],			   # 176
       ["resist_poison", "L"],			   # 180
       ["resist_paralysis", "L"],		   # 184
       ["chameleon", "L:%d\n\t"],		   # 188
@@ -1384,20 +1366,20 @@ my $RD_Actor_Data =
       ["water_breathing", "L"],			   # 196
       ["water_walking", "L"],			   # 200
       ["swift_swim", "L:%d\n\t"],		   # 204
-      ["unknown_#", "L"],			   # 208
+      ["unknown_1", "L"],			   # 208
       ["levitate", "L"],			   # 212
       ["shield", "L"],				   # 216
-      ["unknown_#", "L"],			   # 220
-      ["unknown_#", "L"],			   # 224
+      ["unknown_1", "L"],			   # 220
+      ["unknown_1", "L"],			   # 224
       ["blind", "L:%d\n\t"],			   # 228
-      ["unknown_#", "L"],			   # 232
+      ["unknown_1", "L"],			   # 232
       ["invisibility", "L"],			   # 236
-      ["unknown_#", "L"],			   # 240
-      ["unknown_#", "L:%d\n\t"],		   # 244
-      ["unknown_#", "L"],			   # 248
-      ["unknown_#", "L"],			   # 252
-      ["unknown_#", "L"],			   # 256
-      ["unknown_#", "L"])];
+      ["unknown_1", "L"],			   # 240
+      ["unknown_1", "L:%d\n\t"],		   # 244
+      ["unknown_1", "L"],			   # 248
+      ["unknown_1", "L"],			   # 252
+      ["unknown_1", "L"],			   # 256
+      ["unknown_1", "L"])];
 
 my @RD_Enchantment =
     ([["spell_effect", "s"], ["skill", "c"], ["attribute", "c"], ["range", "c"], ["Unused", "H6"],
@@ -1414,11 +1396,11 @@ my @RD_Enchantment =
 	       $spell .= "/$SKILL{$self->{skill}}";
 	   }
 	   sprintf "Spell_Effect:(%s)  Range:(%s)  Area:%d  Duration:%d  Mag_Min:%d  Mag_Max:%d",
-	       $spell, $RANGE_TYPE{$self->{range}}, $self->{area}, $self->{duration}, $self->{mag_min}, $self->{mag_max}
-	   }});
+          $spell, $RANGE_TYPE{$self->{range}}, $self->{area}, $self->{duration}, $self->{mag_min}, $self->{mag_max} },
+	 });
 
-my @RD_Unknown = ([["unknown_#", "H*"]], { tostr => sub { unknown_data($_[0]->{_subbuf_}); } });
-my @RD_Unknown_ess = ([["unknown_#", "H*"]],
+my @RD_Unknown = ([["unknown_1", "H*"]], { tostr => sub { unknown_data($_[0]->{_subbuf_}); } });
+my @RD_Unknown_ess = ([["unknown_1", "H*"]],
 		      { tostr => sub { unknown_data($_[0]->{_subbuf_}); },
 			rdflags => [qw(ess)] });
 
@@ -1434,90 +1416,6 @@ my @RD_Description = ([["description", "a*"]],
 my %RDFLAGS;
 my %COLUMNS;
 
-# The global %FORMAT_INFO holds some formatting metadata for printing records
-my %FORMAT_INFO;
-$FORMAT_INFO{CLAS}->{CLDT}->{minor_skill_1}->{BOL} = 1;
-$FORMAT_INFO{CREA}->{NPDT}->{attack_min_1}->{BOL} = 1;
-$FORMAT_INFO{CREA}->{NPDT}->{attack_min_2}->{BOL} = 1;
-$FORMAT_INFO{CREA}->{NPDT}->{attack_min_3}->{BOL} = 1;
-$FORMAT_INFO{CREA}->{NPDT}->{gold}->{BOL} = 1;
-$FORMAT_INFO{CREA}->{NPDT}->{str}->{BOL} = 1;
-
-# The global %TYPE_INFO defines record metadata, like grouping and merging strategy
-# The following record types can be merged
-my %TYPE_INFO = map {$_,{canmerge=>1}}
-    (qw(ACTI ALCH APPA ARMO BODY BOOK BSGN CLAS CLOT CONT CREA DOOR ENCH FACT
-	INGR LIGH LOCK MGEF MISC NPC_ PROB REGN REPA SKIL SOUN SPEL WEAP));
-# The following subtypes can be merged on individual fields:
-# each of these subtypes occurs only once per record
-foreach (qw(ALCH.ALDT APPA.AADT ARMO.AODT BOOK.BKDT CLOT.CTDT CREA.AIDT CREA.NPDT
-	    ENCH.ENDT LIGH.LHDT LOCK.LKDT MGEF.MEDT MISC.MCDT NPC_.AIDT NPC_.NPDT
-	    PROB.PBDT REPA.RIDT SPEL.SPDT WEAP.WPDT)) {
-    my($rectype, $subtype) = split(/\./);
-    $TYPE_INFO{$rectype}->{mergefields}->{$subtype} = 1;
-}
-# The following subtypes are treated as a list of groups
-# each group can contain one or more subtypes.
-# an example of a list of a single type would be NPC_.NPCO subrecords
-# which are the list of objects carried by an NPC.
-# format is: RECTYPE.SUBTYPE(groupstart)[.SUBTYPE(groupmember)]*
-# groups/lists need special handling during merging
-# most groups are definitely explicitly by the possible subtypes of their member subrecords
-# but CELL groups are complex and ANY subrecord following an FRMR belongs to that group
-# this is marked with "*" below
-foreach (qw( ALCH.ENAM
-	     ARMO.INDX.BNAM.CNAM
-	     BSGN.NPCS
-	     CLOT.INDX.BNAM.CNAM
-	     CONT.NPCO
-	     CELL.FRMR.*
-	     CREA.AI_T
-	     CREA.AI_W
-	     CREA.DODT.DNAM
-	     CREA.NPCO
-	     CREA.NPCS
-	     CREC.NPCO
-	     ENCH.ENAM
-	     FACT.ANAM.INTV
-	     FACT.RNAM
-	     INFO.SCVR.INTV.FLTV
-	     KLST.KNAM.CNAM
-	     LEVC.CNAM.INTV
-	     LEVI.INAM.INTV
-	     NPC_.AI_T
-	     NPC_.AI_W
-	     NPC_.DODT.DNAM
-	     NPC_.NPCO
-	     NPC_.NPCS
-	     NPCC.NPCO
-	     RACE.NPCS
-	     REGN.SNAM
-	     SPEL.ENAM
-	     SPLM.NAME
-	     TES3.MAST.DATA
-	  )) {
-    my($rectype, $groupstart, @groupmembers) = split(/\./);
-    $TYPE_INFO{$rectype}->{group}->{$groupstart}->{start} = 1;
-    $TYPE_INFO{$rectype}->{group}->{$groupstart}->{member}->{$groupstart} = 1;
-    foreach (@groupmembers) {
-	if ($_ eq '*') {
-	    $TYPE_INFO{$rectype}->{groupall}->{$groupstart} = 1;
-	} else {
-	    $TYPE_INFO{$rectype}->{group}->{$_}->{member}->{$groupstart} = 1;
-	}
-    }
-}
-# The following subtypes can be merged as group lists
-foreach (qw(CONT.NPCO CREA.DODT.DNAM CREA.NPCO CREA.NPCS NPC_.DODT NPC_.NPCO NPC_.NPCS)) {
-    my($rectype, $subtype) = split(/\./);
-    $TYPE_INFO{$rectype}->{mergegroup}->{$subtype} = 1;
-}
-
-
-
-#warn "DBG:".Dumper(\%TYPE_INFO)."\n";
-
-# Note: fieldnames that end in _# will get an automatically generated suffix_index
 my @RECDEFS =
     (
      [ACTI => [
@@ -1525,25 +1423,29 @@ my @RECDEFS =
 	       [FNAM => [["name", "Z*"]]],
 	       [MODL => [["model", "Z*"]]],
 	       [SCRI => [["script", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [ALCH => [
 	       [NAME => [["id", "Z*"]]],
-	       [ALDT => [["weight", "f"], ["value", "L"], ["autocalc", "L", { lookup => \%YESNO }]]],
+           [ALDT => [["weight", "f"], ["value", "L"], ["autocalc", "L", { lookup => \%YESNO }]],
+    	{
+    	 rdflags => [qw(mergeable)] }],
 	       [ENAM => @RD_Enchantment],
 	       [FNAM => [["name", "Z*"]]],
 	       [MODL => [["model", "Z*"]]],
 	       [SCRI => [["script", "Z*"]]],
 	       [TEXT => [["icon", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [APPA => [
 	       [NAME => [["id", "Z*"]]],
 	       [AADT => [["type", "L", { lookup => \%APPARATUS_TYPE }],
-			 ["quality", "f"], ["weight", "f"], ["value", "L"]]],
+    		 ["quality", "f"], ["weight", "f"], ["value", "L"]],
+    	{
+    	 rdflags => [qw(mergeable)] }],
 	       [FNAM => [["name", "Z*"]]],
 	       [ITEX => [["icon", "Z*"]]],
 	       [MODL => [["model", "Z*"]]],
 	       [SCRI => [["script", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [ARMO => [
 	       [NAME => [["id", "Z*"]]],
 	       [AODT => [["type", "L", { lookup => \%ARMOR_TYPE }], ["weight", "f"], ["value", "L"], ["health", "L"],
@@ -1557,7 +1459,8 @@ my @RECDEFS =
 		      sprintf("Type:(%s)  Weight:%0.2f ($weight_class)  Value:%d  Health:%d  Enchantment:%d  AR:%d",
 			      $ARMOR_TYPE{$self->{type}}, $self->{weight}, $self->{value},
 			      $self->{health}, $self->{enchantment}, $self->{ar});
-		  }}],
+		  },
+		  rdflags => [qw(mergeable)] }],
 	       [BNAM => [["male_body_id", ["Z*", "a*"]]]],
 	       [CNAM => [["female_body_id", "a*"]]],
 	       [ENAM => [["enchanting", "Z*"]]],
@@ -1566,7 +1469,7 @@ my @RECDEFS =
 	       [ITEX => [["icon", "Z*"]]],
 	       [MODL => [["model", "Z*"]]],
 	       [SCRI => [["script", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [BODY => [
 	       [NAME => [["id", "Z*"]]],
 	       [BYDT => [["part", "C", { lookup => \%BYDT_PART }],
@@ -1575,11 +1478,11 @@ my @RECDEFS =
 			 ["part_type", "C", { lookup => \%BYDT_PTYP }]]],
 	       [FNAM => [["skin_race", "Z*"]]],
 	       [MODL => [["model", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [BOOK => [
 	       [NAME => [["id", "Z*"]]],
 	       [BKDT => [["weight", "f"], ["value", "L"], ["scroll", "L", { lookup => \%YESNO }],
-			 ["teaches", "l", { lookup => \%SKILL }], ["enchantment", "L"]]],
+			 ["teaches", "l", { lookup => \%SKILL }], ["enchantment", "L"]], { rdflags => [qw(mergeable)] }],
 	       [ENAM => [["enchanting", "Z*"]]],
 	       [FNAM => [["name", "Z*"]]],
 	       [ITEX => [["icon", "Z*"]]],
@@ -1592,14 +1495,14 @@ my @RECDEFS =
 		      (WRAP) ? wrap("","\t", "Text:$str") : "Text:$str";
 		  },
 		}],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [BSGN => [
 	       [NAME => [["id", "Z*"]]],
 	       [DESC => @RD_Description],
 	       [FNAM => [["name", "Z*"]]],
 	       [NPCS => [["spell", ["Z32", "a32"]]]], # Spells
 	       [TNAM => [["image", "Z*"]]]
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [CELL => [
 	       [AADT => @RD_Unknown_ess],
 	       [AMBI => [["ambient", "L"], ["sunlight", "L"], ["fog", "L"], ["fog_density", "f"]],
@@ -1610,7 +1513,8 @@ my @RECDEFS =
 		  }}
 	       ],
 	       [FRMR => [],	# "form reference"?
-		{ @RD_reference }],
+		{ @RD_reference,
+		  rdflags => [qw(startgroup)] }],
 	       [ANAM => [["owner_actor", "Z*"]]],
 	       [BNAM => [["global", "Z*"]]],
 
@@ -1628,7 +1532,7 @@ my @RECDEFS =
 		     } elsif ($CURRENT_GROUP eq 'MVRF') {
 			 $self->{cell_destination} = unpack("Z*", $buff);
 		     } else {
-			 $self->{"unknown_#"} = unpack("H*", $buff);
+			 $self->{"unknown_1"} = unpack("H*", $buff);
 		     }
 		     return($self);
 		 },
@@ -1717,7 +1621,7 @@ my @RECDEFS =
 		     }
 		 },
 		}],
-	       [DNAM => [["destination", "Z*"]]],
+	       [DNAM => [["door_destination", "Z*"]]],
 	       [DODT => [["x", "f"], ["y", "f"], ["z", "f"], ["x_angle", "f"], ["y_angle", "f"], ["z_angle", "f"]]],
 	       [FLTV => [["lock_level", "L"]]],
 	       [INDX => @RD_Unknown], # seems to only coincide with CNAM(Owner_Faction) subrecords
@@ -1770,7 +1674,8 @@ my @RECDEFS =
 		}],
 
 	       [KNAM => [["key", "Z*"]]],
-	       [NAM0 => [["reference_count", "L"]]],
+		   [LUAT => [["MWSE_Lua", "Z*"]]], # LUA type from MWSE 2.x /abot
+	       [NAM0 => [["reference_count", "L"]], { rdflags => [qw(startgroup)] }],
 	       [NAM5 => [["color", "L"]]], # Map Color (TBD - display as RGB)
 	       [NAME => [["name", "Z*"]]],
 	       [RGNN => [["region", "Z*"]]],
@@ -1799,7 +1704,8 @@ my @RECDEFS =
 	       [MPNT => @RD_Unknown_ess],
 	       # (MVRF is encode/decoded just like the FRMR subrecord)
 	       [MVRF => [],	# "moved reference"?
-		{ @RD_reference }],
+		{ @RD_reference,
+		  rdflags => [qw(startgroup)] }],
 	       [NAM8 => @RD_Unknown_ess],
 	       #[NAM8 => @RD_short_array_ess], # looks like it might be an array of shorts ???
 	       [NAM9 => [["owned", "L"]]],
@@ -1842,30 +1748,32 @@ my @RECDEFS =
 	       [CLDT => [["primary_attribute_1", "l", { lookup => \%ATTRIBUTE }],
 			 ["primary_attribute_2", "l", { lookup => \%ATTRIBUTE }],
 			 ["specialization", "L", { lookup => \%SPECIALIZATION }],
-			 (["minor_skill_#", "l", { lookup => \%SKILL }], ["major_skill_#", "l", { lookup => \%SKILL }]) x 5,
+			 (["minor_skill_1", "l", { lookup => \%SKILL }], ["major_skill_1", "l", { lookup => \%SKILL }]) x 5,
 			 ["flags", "L", { lookup => \%PLAYABLE }],
 			 ["autocalc", "L", { symflags => \%AUTOCALC_FLAGS }]],
 		{ columns => 2 }],
 	       [DESC => @RD_Description],
 	       [FNAM => [["name", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [CLOT => [
 	       [NAME => [["id", "Z*"]]],
 	       [BNAM => [["male_clothing", "a*"]]],
 	       [CNAM => [["female_clothing", ["Z*", "a*"]]]],
 	       [CTDT => [["type", "L", { lookup => \%CTDT_TYPE }], ["weight", "f"],
-			 ["value", "S"], ["enchantment", "S"]]],
+			 ["value", "S"], ["enchantment", "S"]], { rdflags => [qw(mergeable)] }],
 	       [ENAM => [["enchanting", "Z*"]]],
 	       [FNAM => [["name", "Z*"]]],
-	       [INDX => [["biped_object", "C", { lookup => \%BIPED_OBJECT } ]]],
+	       [INDX => [["biped_object", "C", { lookup => \%BIPED_OBJECT } ]],
+		{
+		 rdflags => [qw(startgroup)] }],
 	       [ITEX => [["icon", "Z*"]]],
 	       [MODL => [["model", "Z*"]]],
 	       [SCRI => [["script", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [CNTC => [
 	       [NAME => [["id", "Z*"]]],
 	       [INDX => [["index", "L"]]],
-	       [NPCO => [["count", "l"], ["object", ["Z32", "a32"]]]], # Contained Object
+	       [NPCO => [["count", "l"], ["Name", ["Z32", "a32"]]]], # Objects
 	       [SCRI => [["script", "Z*"]]],
 	       [SLCS => [["n_shorts", "L"], ["n_longs", "L"], ["n_floats", "L"]]],
 	       [SLFD => @RD_float_array_ess], # Script Localvar Float Data
@@ -1874,6 +1782,7 @@ my @RECDEFS =
 	       [XCHG => [["enchant_charge", "f"]]],
 	       [XHLT => [["health", "L"]]],
 	       [XIDX => [["scripted_item_index", "L"]]],
+	       [LUAT => [["MWSE_Lua", "Z*"]]], # LUA type from MWSE 2.x /abot
 	       [XSOL => [["soul", "Z*"]]],
 	      ], { rdflags => [qw(ess)] }],
      [CONT => [
@@ -1881,23 +1790,24 @@ my @RECDEFS =
 	       [FNAM => [["name", "Z*"]]],
 	       [CNDT => [["weight", "f"]]],
 	       [FLAG => [["container_flags", "L", { symflags => \%CONTAINER_FLAGS }]]],
-	       [INDX => [["unknown_#", "L"]], { rdflags => [qw(ess)] }],
+	       [INDX => [["unknown_1", "L"]], { rdflags => [qw(ess)] }],
 	       [MODL => [["model", "Z*"]]],
-	       [NPCO => [["count", "l"], ["object", ["Z32", "a32"]]]],
+	       [NPCO => [["count", "l"], ["Name", ["Z32", "a32"]]]], # Objects
 	       [SCRI => [["script", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      # CHECK CS ??? (Animations? Unknowns?)
      [CREA => [
 	       [NAME => [["id", "Z*"]]],
-	       [AIDT => [["hello", "C"], ["unknown_#", "C"], ["fight", "C"], ["flee", "C"],
-			 ["alarm", "C"], ["unknown_#", "H6"], ["services", "L", { symflags => \%AIDT_FLAGS }]]],
+	       [AIDT => [["hello", "C"], ["unknown_1", "C"], ["fight", "C"], ["flee", "C"],
+			 ["alarm", "C"], ["unknown_1", "H6"], ["flags", "L", { symflags => \%AIDT_FLAGS }]],
+		{
+		 rdflags => [qw(mergeable)] }],
 	       [AI_E => @RD_AI_Escort],
 	       [AI_F => @RD_AI_Follow],
 	       [AI_T => @RD_AI_Travel],
 	       [AI_W => @RD_AI_Wander_CREA],
 	       [CNAM => [["sound_gen_creature", "Z*"]]],
-	       [CNDT => [["data", "Z*"]]], # rare???
-	       [DNAM => [["destination", "Z*"]]],
+	       [DNAM => @RD_Unknown],
 	       [DODT => [["x", "f"], ["y", "f"], ["z", "f"], ["x_angle", "f"], ["y_angle", "f"], ["z_angle", "f"]]],
 	       [FLAG => [["flags", "L"]],
 		{ tostr => sub {
@@ -1920,19 +1830,20 @@ my @RECDEFS =
 	       [FNAM => [["name", "Z*"]]],
 	       [INDX => @RD_Unknown_ess],
 	       [MODL => [["model", "Z*"]]],
-	       [NPCO => [["count", "l"], ["object", ["Z*", "a32"]]]], # Inventory Objects
+	       [NPCO => [["count", "l"], ["name", ["Z*", "a32"]]]], # Objects (Inventory)
 	       [NPCS => [["spell", ["Z32", "a32"]]]],		    # Spells
 	       [NPDT => [["type", "L", { lookup => \%CREA_TYPE }], ["lev", "L"], ["str", "L"], ["int", "L"], ["wil", "L"],
 			 ["agi", "L"], ["spd", "L"], ["end", "L"], ["per", "L"], ["lck", "L"],
 			 ["health", "L"], ["spell_points", "L"], ["fatigue", "L"], ["soul", "L"],
 			 ["combat", "L"], ["magic", "L"], ["stealth", "L"],
-			 (["attack_min_#", "L"], ["attack_max_#", "L"]) x 3,
+			 (["attack_min_1", "L"], ["attack_max_1", "L"]) x 3,
 			 ["gold", "L"]],
-		{ columns => 4}],
+		{
+		 columns => 4, rdflags => [qw(mergeable)] }],
 	       [SCRI => [["script", "Z*"]]],
 	       [XSCL => [["scale", "f"]]],
-	      ]],
-     [CREC => [			# "Creature Changes?" in savedgames
+	      ], { rdflags => [qw(mergeable)] }],
+	 [CREC => [			# "Creature Changes?" in savedgames
 	       [NAME => [["id", "Z*"]]],
 	       [AI_A => @RD_AI_Activate],
 	       [AI_E => @RD_AI_Escort],
@@ -1940,7 +1851,7 @@ my @RECDEFS =
 	       [AI_T => @RD_AI_Travel],
 	       [AI_W => @RD_AI_Wander_CREA],
 	       [INDX => [["instance", "L"]]],
-	       [NPCO => [["count", "l"], ["object", ["Z*", "a32"]]]], # Inventory Objects
+	       [NPCO => [["count", "l"], ["name", ["Z*", "a32"]]], { rdflags => [qw(startgroup)] }], # Objects (Inventory)
 	       [SCRI => [["script", "Z*"]]],
 	       [SLCS => [["n_shorts", "L"], ["n_longs", "L"], ["n_floats", "L"]]],
 	       [SLFD => @RD_float_array_ess], # Script Localvar Float Data
@@ -1950,6 +1861,7 @@ my @RECDEFS =
 	       [XCHG => [["enchant_charge", "f"]]],
 	       [XHLT => [["health", "L"]]],
 	       [XIDX => [["index", "L"]]], # ???
+	       [LUAT => [["MWSE_Lua", "Z*"]]], # LUA type from MWSE 2.x /abot
 	       [XSCL => [["scale", "f"]]],
 	       [XSOL => [["soul", "Z*"]]],
 	      ], { rdflags => [qw(ess)] }],
@@ -1975,40 +1887,39 @@ my @RECDEFS =
 	       [MODL => [["model", "Z*"]]],
 	       [SCRI => [["script", "Z*"]]],
 	       [SNAM => [["door_open_sound", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [ENCH => [
 	       [NAME => [["id", "Z*"]]],
 	       [ENAM => @RD_Enchantment],
 	       [ENDT => [["type", "L", { lookup => \%ENCHANT_TYPE }],
 			 ["cost", "L"], ["charge", "L"],
 			 ["autocalc", "s", { lookup => \%ENDT_AUTO }],
-			 ["Unused", "s"]]],
-	      ]],
+			 ["Unused", "s"]],
+		{
+		 rdflags => [qw(mergeable)] }]]],
      # CHECK CS ??? (what is stuff in CS dialog box in lower right?)
      [FACT => [
 	       [NAME => [["id", "Z*"]],
 		{ tostr => sub {
 		      my($self) = @_;
-		      %FACTION_RANK = (); # reset
-		      #$FACTION_INDEX{$self->{id}} = $FACT_I++;
+		      $FACTION_INDEX{$self->{id}} = $FACT_I++;
 		      $self->{id};
 		  }
 		}],
-	       [ANAM => [["faction", "a*"]]],
+	       [ANAM => [["faction", "a*"]], { rdflags => [qw(startgroup)] }],
 	       [FADT => [["attrib_1", "l", { lookup => \%ATTRIBUTE}],
 			 ["attrib_2", "l", { lookup => \%ATTRIBUTE}],
-			 (["at1_#", "l"], ["at2_#", "l"], ["sk1_#", "l"], ["sk2_#", "l"], ["rep_#", "l"]) x 10,
-			 (["sk_#", "l"]) x 6,
+			 (["at1_1", "l"], ["at2_1", "l"], ["sk1_1", "l"], ["sk2_1", "l"], ["rep_1", "l"]) x 10,
+			 (["sk_1", "l"]) x 6,
 			 ["unknown", "l"], ["flags", "L"]],
 		{ tostr => sub {
 		      my($self) = @_;
 		      my @ranks = ((defined $self->{_id_}) and (defined $FACTION_RANK{$self->{_id_}})) ?
 			  @{$FACTION_RANK{$self->{_id_}}} : ();
+		      my $n = 1;
 		      my @tostr = (sprintf("Attrib_1:(%s)  Attrib_2:(%s)  Flags:%s  Unknown:%d",
 					   $ATTRIBUTE{$self->{attrib_1}}, $ATTRIBUTE{$self->{attrib_2}},
 					   flags_tostr($self->{flags}, \%FACT_FLAGS), $self->{unknown}));
-		      # (Change the following if suffix_index strategy changes)
-		      my $n = 1;
 		      while (defined($self->{"at1_$n"}) and defined($ranks[$n-1])) {
 			  my $shim = ($n < 10) ? " " : "";
 			  push(@tostr, sprintf("\t%-20s ${shim}At1_$n:%2d  ${shim}At2_$n:%2d  ${shim}Sk1_$n:%2d  ${shim}Sk2_$n:%2d  ${shim}Rep_$n:%3d",
@@ -2016,13 +1927,11 @@ my @RECDEFS =
 			  $n++;
 		      }
 		      if (DBG) {
-			  # (Change the following if suffix_index strategy changes)
 			  foreach my $i (1..6) {
 			      defined($self->{"sk_$i"}) or abort(qq{FACT::FADT->tostr: self{sk_$i} undefined});
 			      defined($SKILL{$self->{"sk_$i"}}) or abort(qq{FACT::FADT->tostr: no SKILL defined for: $self->{"sk_$i"} (sk_$i)});
 			  }
 		      }
-		      # (Change the following if suffix_index strategy changes)
 		      push(@tostr, sprintf("\t%-20s  %-20s  %-20s", map { qq{sk_$_:($SKILL{$self->{"sk_$_"}})}; } 1..3));
 		      push(@tostr, sprintf("\t%-20s  %-20s  %-20s", map { qq{sk_$_:($SKILL{$self->{"sk_$_"}})}; } 4..6));
 
@@ -2033,17 +1942,18 @@ my @RECDEFS =
 	       [RNAM => [["rank", ["Z32", "a32"]]],
 		{ tostr => sub {
 		      my($self) = @_;
+		      #dbg(qq{Adding: $self->{rank} to FACTION_RANK: $self->{_id_}}) if (DBG);
 		      push(@{$FACTION_RANK{$self->{_id_}}}, $self->{rank});
 		      "Rank:$self->{rank}";
 		  }}],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [FMAP => [			# ess, single record, no id
 	       [MAPD => @RD_Unknown],
 	       [MAPH => @RD_Unknown],
 	      ], { id => sub {'()'},
 		   rdflags => [qw(ess)] }],
      [GAME => [			# ess, single record, no id
-	       [GMDT => [["current_cell", ["Z64", "a64"]], ["x", "l"], ["y", "l"], ["long_#", "l"], ["long_#", "l"], ["unknown_#", "H*"]]], # there is junk following the cell name ... not clear if there's a max cell name size?
+	       [GMDT => [["current_cell", ["Z64", "a64"]], ["x", "l"], ["y", "l"], ["long_1", "l"], ["long_1", "l"], ["unknown_1", "H*"]]], # there is junk following the cell name ... not clear if there's a max cell name size?
 	      ], { id => sub {'()'}, rdflags => [qw(ess)] }],
      [GLOB => [
 	       [NAME => [["id", "Z*"]]],
@@ -2077,8 +1987,8 @@ my @RECDEFS =
 		  },
 		}],
 	       [CNAM => [["class", "Z*"]]],
-	       [DATA => [["unknown_#", "L"], ["disposition", "L"], ["rank", "c"],
-			 ["sex", "c"], ["pc_rank", "c"], ["unknown_#", "C"]],
+           [DATA => [["unknown_1", "L"], ["disposition", "L"], ["rank", "c"],
+			 ["sex", "c"], ["pc_rank", "c"], ["unknown_1", "C"]],
 		{ tostr => sub {
 		      my($self) = @_;
 		      if ($CURRENT_DIAL =~ /^Journal/i) {
@@ -2095,7 +2005,7 @@ my @RECDEFS =
 	       [DNAM => [["pc_faction", "Z*"]]],
 	       [FLTV => [["result_value", "f"]]],
 	       [FNAM => [["faction", "Z*"]]],
-	       [INTV => [["compare_value", "l"]]],
+	       [INTV => [["compare_value", "L"]]],
 	       [NAME => [["response", "a*"]],
 		{ tostr => sub {
 		      my($self) = @_;
@@ -2112,29 +2022,28 @@ my @RECDEFS =
 	       [NNAM => [["next_id", "Z*"]]],
 	       [ONAM => [["actor", "Z*"]]],
 	       [PNAM => [["prev_id", "Z*"]]],
-	       [QSTF => [["quest_finished", "C"]]], # TBD check format (was: "C:")
-	       [QSTN => [["quest_name", "C"]]], # TBD check format (was: "C:")
-	       [QSTR => [["quest_restart", "C"]]], # TBD check format (was: "C:")
+	       [QSTF => [["quest_finished", "C:"]]],
+	       [QSTN => [["quest_name", "C:"]]],
+	       [QSTR => [["quest_restart", "C:"]]],
 	       [RNAM => [["race", "Z*"]]],
 	       [SCVR => [["index", "a"],
 			 ["type", "a", { lookup => \%INFO_SCVR_TYPE}],
 			 ["function", "a2", { lookup => \%INFO_FUN }],
 			 ["comparison", "a", { lookup => \%INFO_SCVR_CMP }],
-			 ["name", "a*"]]],
+			 ["name", "a*"]], { rdflags => [qw(startgroup)] }],
 	       [SNAM => [["sound_file", "Z*"]]],
 	      ]],
-     [INGR => [
+	 [INGR => [
 	       [NAME => [["id", "Z*"]]],
 	       [FNAM => [["name", "Z*"]]],
 	       [IRDT => [["weight", "f"], ["value", "L"],
-			 (["effect_#", "l"]) x 4,
-			 (["skill_#", "l"]) x 4,
-			 (["attribute_#", "l"]) x 4,
+			 (["effect_1", "l"]) x 4,
+			 (["skill_1", "l"]) x 4,
+			 (["attribute_1", "l"]) x 4,
 			],
 		{ tostr => sub {
 		      my($self) = @_;
 		      my @effects;
-		      # (Change the following if suffix_index strategy changes)
 		      foreach my $i (1..4) {
 			  if ($self->{"effect_$i"} != -1) {
 			      my $eix = $self->{"effect_$i"};
@@ -2148,133 +2057,29 @@ my @RECDEFS =
 			      }
 			  }
 		      }
-		      my $effects = (@effects) ? ("\n\t" . join("\n\t", @effects)) : "";
-		      sprintf("Weight:%0.2f  Value:%d$effects",
-			      $self->{weight}, $self->{value});
+		      sprintf("Weight:%0.2f  Value:%d\n\t%s",
+			      $self->{weight}, $self->{value}, join("\n\t", @effects));
 		  }}],
 	       [ITEX => [["icon", "Z*"]]],
 	       [MODL => [["model", "Z*"]]],
 	       [SCRI => [["script", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [JOUR => [
 	       [NAME => [["id", "Z*"]], { rdflags => [qw(ess)] }],
 	      ]],
      [KLST => [
-	       [KNAM => [["id", "Z*"]]],
+	       [KNAM => [["id", "Z*"]], { rdflags => [qw(startgroup)] }],
 	       [CNAM => [["dead_count", "L"]]],
 	       [INTV => [["end_of_list", "L"]]],
 	      ], { rdflags => [qw(ess)] }],
      [LAND => [
 	       [INTV => [["x", "l"], ["y", "l"]]],
 	       [DATA => @RD_Unknown],
-	       [VCLR => [],	# (Vertex RGB Color Array, 65 x 65)
-		{ decode => sub {
-		      my($self, $buff, $parent) = @_;
-		      $self->{_subbuf_} = $buff;
-		      # my $array_length = 65 * 65;
-		      $self->{_array_} = [unpack("(H6)*", $buff)];
-		      return($self);
-		  },
-		  encode => sub {
-		      my($self) = @_;
-		      $self->{_subbuf_} = pack("(H6)*", @{$self->{_array_}});
-		      return($self);
-		  },
-		  tostr => sub {
-		      my($self) = @_;
-		      my $str = "(Vertex RGB Color Array, 65 x 65):";
-		      foreach my $i (0..64) {
-			  $str .= sprintf("\n   %2d:", $i) . 
-			      join(",", map { $self->{_array_}->[($i * 65) + $_] } (0..64));
-		      }
-		      $str;
-		  }}],
-	       [VHGT => [],	# (Vertex Height Array, 65 x 65)
-		{ decode => sub {
-		      my($self, $buff, $parent) = @_;
-		      $self->{_subbuf_} = $buff;
-		      my $array_length = 65 * 65;
-		      #my(@data) = unpack("fcc${array_length}s", $buff); # Dave Humphries
-		      my(@data) = unpack("fc${array_length}sc", $buff); # OpenMW
-		      $self->{offset} = shift(@data);
-		      $self->{unknown_1} = shift(@data);
-		      $self->{unknown_2} = pop(@data);
-		      $self->{_array_} = \@data;
-		      return($self);
-		  },
-		  encode => sub {
-		      my($self) = @_;
-		      my $array_length = 65 * 65;
-		      #$self->{_subbuf_} = pack("fcc${array_length}s", # Dave Humphries
-		      $self->{_subbuf_} = pack("fc${array_length}sc", # OpenMW
-					       $self->{offset}, $self->{unknown_1},
-					       @{$self->{_array_}},
-					       $self->{unknown_2});
-		      return($self);
-		  },
-		  tostr => sub {
-		      my($self) = @_;
-		      my $str = qq{Offset:$self->{offset}  Unknown_1:$self->{unknown_1}  Unknown_2:$self->{unknown_2}
-\t(Vertex Height Array, 65 x 65):};
-		      foreach my $i (0..64) {
-			  $str .= sprintf("\n   %2d:", $i) .
-			      join(",", map { $self->{_array_}->[($i * 65) + $_] } (0..64));
-		      }
-		      $str;
-		  }}],
-	       [VNML =>  [], # (Vertex Normal Array, 65 x 65)
-		{ decode => sub {
-		      my($self, $buff, $parent) = @_;
-		      $self->{_subbuf_} = $buff;
-		      $self->{_array_} = [unpack("(H6)*", $buff)];
-		      return($self);
-		  },
-		  encode => sub {
-		      my($self) = @_;
-		      $self->{_subbuf_} = pack("(H6)*", @{$self->{_array_}});;
-		      return($self);
-		  },
-		  tostr => sub {
-		      my($self) = @_;
-		      my $str = "(Vertex Normal Array, 65 x 65):";
-		      foreach my $i (0..64) {
-			  $str .= sprintf("\n   %2d:", $i) .
-			      join(",", map { $self->{_array_}->[($i * 65) + $_] } (0..64));
-		      }
-		      $str;
-		  }}],
-	       [VTEX => [], # (Vertex Texture Index Array, 16 x 16)
-		{ decode => sub {
-		      my($self, $buff, $parent) = @_;
-		      $self->{_subbuf_} = $buff;
-		      $self->{_array_} = [unpack("s*", $buff)];
-		      return($self);
-		  },
-		  encode => sub {
-		      my($self) = @_;
-		      $self->{_subbuf_} = pack("s*", @{$self->{_array_}});
-		      return($self);
-		  },
-		  tostr => sub {
-		      my($self) = @_;
-		      my $str = "(Vertex Texture Index Array, 16 x 16):";
-		      foreach my $i (0..15) {
-			  $str .= sprintf("\n   %2d:", $i) .
-			      join(",", map { $self->{_array_}->[($i * 16) + $_] } (0..15));
-		      }
-		      $str;
-		  }
-		 }],
-	       [WNAM => [(["i_#", "c*"]) x (9 * 9)], # low-LOD heightmap
-		{ tostr => sub {
-		      my($self) = @_;
-		      my $str = "(low-LOD Heightmap, 9 x 9):";
-		      foreach my $i (1..9) {
-			  $str .= sprintf("\n   %2d:", ($i-1)) .
-			      join(",", map { $self->{"i_".((($i-1) * 9) + $_)} } (1..9));
-		      }
-		      $str;
-		  }}],
+	       [VCLR => @RD_Unknown],
+	       [VHGT => @RD_Unknown],
+	       [VNML => @RD_Unknown],
+	       [VTEX => @RD_Unknown],
+	       [WNAM => @RD_Unknown],
 	      ], { id => sub {
 		       my($self) = @_;
 		       return($self->{_id_}) if (defined $self->{_id_});
@@ -2290,7 +2095,7 @@ my @RECDEFS =
 	       [DATA => [["list_flags", "L", { symflags => \%LEVC_FLAGS }]]],
 	       [INDX => [["item_count", "L"]]],
 	       [NNAM => [["chance_none", "C"]]],
-	       [CNAM => [["creature_id", "Z*"]]],
+	       [CNAM => [["creature_id", "Z*"]], { rdflags => [qw(startgroup)] }],
 	       [INTV => [["level", "S"]]],
 	      ]],
      [LEVI => [
@@ -2298,7 +2103,7 @@ my @RECDEFS =
 	       [DATA => [["list_flags", "L", { symflags => \%LEVI_FLAGS }]]],
 	       [INDX => [["item_count", "L"]]],
 	       [NNAM => [["chance_none", "C"]]],
-	       [INAM => [["item_id", "Z*"]]],
+	       [INAM => [["item_id", "Z*"]], { rdflags => [qw(startgroup)] }],
 	       [INTV => [["level", "S"]]],
 	      ]],
      [LIGH => [
@@ -2316,7 +2121,7 @@ my @RECDEFS =
 	       [MODL => [["model", "Z*"]]],
 	       [SCRI => [["script", "Z*"]]],
 	       [SNAM => [["sound_id", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [LOCK => [
 	       [NAME => [["id", "Z*"]]],
 	       [FNAM => [["name", "Z*"]]],
@@ -2324,12 +2129,12 @@ my @RECDEFS =
 	       [LKDT => [["weight", "f"], ["Value", "L"], ["Quality", "f"], ["Uses", "L"]]],
 	       [MODL => [["model", "Z*"]]],
 	       [SCRI => [["script", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      # CHECK CS ???
      [LTEX => [
 	       [NAME => [["id", "Z*"]]],
 	       [DATA => [["texture_path", "Z*"]]],
-	       [INTV => [["index", "L"]]],
+	       [INTV => [["unknown_1", "L"]]],
 	      ]],
      [MGEF => [
 	       [INDX => [["id", "l", { lookup => \%SPELL_EFFECT }]]],
@@ -2347,7 +2152,7 @@ my @RECDEFS =
 			 ["red", "L"], ["green", "L"], ["blue", "L"],
 			 ["speed", "f"], ["size", "f"], ["sizecap", "f"]]],
 	       [PTEX => [["Particle_Texture", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [MISC => [
 	       [NAME => [["id", "Z*"]]],
 	       [FNAM => [["name", "Z*"]]],
@@ -2355,14 +2160,14 @@ my @RECDEFS =
 	       [MCDT => [["weight", "f"], ["value", "L"], ["key_for_lock", "L", { lookup => \%YESNO }]]],
 	       [MODL => [["model", "Z*"]]],
 	       [SCRI => [["script", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [NPCC => [			# "NPC Changes?" records in savedgames
 	       [NAME => [["id", "Z*"]]],
 	       [AI_E => @RD_AI_Escort],
 	       [AI_F => @RD_AI_Follow],
 	       [AI_T => @RD_AI_Travel],
 	       [AI_W => @RD_AI_Wander_NPC],
-	       [NPCO => [["count", "l"], ["object", ["Z*", "a32"]]]], # Inventory Objects
+	       [NPCO => [["count", "l"], ["Name", ["Z*", "a32"]]], { rdflags => [qw(startgroup)] }], # Objects (Inventory)
 	       [NPDT => @RD_Unknown],
 	       [SCRI => [["script", "Z*"]]],
 	       [SLCS => [["n_shorts", "L"], ["n_longs", "L"], ["n_floats", "L"]]],
@@ -2373,14 +2178,15 @@ my @RECDEFS =
 	       [XCHG => [["enchant_charge", "f"]]],
 	       [XHLT => [["health", "L"]]],
 	       [XIDX => [["index", "L"]]], # ???
+		   [LUAT => [["MWSE_Lua", "Z*"]]], # LUA type from MWSE 2.x /abot
 	       [XSOL => [["soul", "Z*"]]],
 	      ], { rdflags => [qw(ess)] }],
      # CHECK CS ???
      [NPC_ => [
 	       [NAME => [["id", "Z*"]]],
 	       [FNAM => [["name", "Z*"]]],
-	       [AIDT => [["hello", "C"], ["unknown_#", "C"], ["fight", "C"], ["flee", "C"], ["alarm", "C"],
-			 ["unknown_#", "H6"], ["services", "L", { symflags => \%AIDT_FLAGS }]]],
+	       [AIDT => [["hello", "C"], ["unknown_1", "C"], ["fight", "C"], ["flee", "C"], ["alarm", "C"],
+			 ["unknown_1", "H6"], ["flags", "L", { symflags => \%AIDT_FLAGS }]]],
 	       [AI_A => @RD_AI_Activate],
 	       [AI_E => @RD_AI_Escort],
 	       [AI_F => @RD_AI_Follow],
@@ -2390,23 +2196,22 @@ my @RECDEFS =
 	       [BNAM => [["head_model", "Z*"]]],
 	       [CNAM => [["class", "Z*"]]],
 	       [CNDT => [["data", "Z*"]]],
-	       [DNAM => [["destination", "Z*"]]],
-	       [DODT => [["x", "f"], ["y", "f"], ["z", "f"], ["x_angle", "f"], ["y_angle", "f"], ["z_angle", "f"]]],
+	       [DNAM => [["door_destination", "Z*"]], { rdflags => [qw(ess)] }],
+	       [DODT => [["x", "f"], ["y", "f"], ["z", "f"], ["x_angle", "f"], ["y_angle", "f"], ["z_angle", "f"]], { rdflags => [qw(ess)] }],
 	       [FLAG => [["flags", "L", { symflags => \%NPC_FLAGS }]]],
 	       [KNAM => [["hair_model", "Z*"]]],
 	       [MODL => [["model", "Z*"]]],
-	       [NPCO => [["count", "l"], ["object", ["Z*", "a32"]]]], # Inventory Objects
-	       [NPCS => [["spell", ["Z32", "a32"]]]],		      # Spells
+	       [NPCO => [["count", "l"], ["name", ["Z*", "a32"]]]], # Objects (Inventory)
+	       [NPCS => [["spell", ["Z32", "a32"]]]],		    # Spells
 	       [NPDT => [],
 		{
 		 decode => sub {
 		     my($self, $buff, $parent) = @_;
 		     $self->{_id_} = $parent->{_id_};
 		     $self->{_subbuf_} = $buff;
-		     $self->{_parent_} = $parent;
 		     my $blen = length($buff);
 		     if ($blen == 12) {
-			 ($self->{level}, $self->{disposition}, $self->{factionindex}, $self->{rank},
+			 ($self->{level}, $self->{disposition}, $self->{faction}, $self->{rank},
 			  $self->{unk1}, $self->{unk2}, $self->{unk3}, $self->{gold}) =
 			      unpack("SC6L", $buff);
 		     } elsif ($blen == 52) {
@@ -2415,8 +2220,8 @@ my @RECDEFS =
 			     $self->{lc($SKILL{$i++})} = $skill_level;
 			 }
 			 ($self->{level}, $self->{str}, $self->{int}, $self->{wil}, $self->{agi}, $self->{spd},
-			  $self->{end}, $self->{per}, $self->{lck}, $self->{reputation}, $self->{health},
-			  $self->{magicka}, $self->{fatigue}, $self->{disposition}, $self->{factionindex},
+			  $self->{end}, $self->{per}, $self->{lck}, $self->{rep}, $self->{health},
+			  $self->{magicka}, $self->{fatigue}, $self->{disposition}, $self->{faction},
 			  $self->{rank}, $self->{gold}) = unpack("SC8x[C27]CSSSCCCxL", $buff);
 		     } else {
 			 err("DECODER barfed on NPC_.NPDT, Invalid length: $blen, expected 52 or 12!");
@@ -2443,17 +2248,17 @@ my @RECDEFS =
 				  $self->{acrobatics}, $self->{light_armor}, $self->{short_blade}, $self->{marksman},
 				  $self->{mercantile}, $self->{speechcraft}, $self->{hand_to_hand},
 				  # C
-				  $self->{reputation},
+				  $self->{rep},
 				  # S3
 				  $self->{health}, $self->{magicka}, $self->{fatigue},
 				  # C3
-				  $self->{disposition}, $self->{factionindex}, $self->{rank},
+				  $self->{disposition}, $self->{faction}, $self->{rank},
 				  # L
 				  $self->{gold});
 			 assert(length($self->{_subbuf_}) == 52, "Invalid NPDT length (@{[length($self->{_subbuf_})]})") if (ASSERT);
 		     } else {
 			 $self->{_subbuf_} =
-			     pack("SC6L", $self->{level}, $self->{disposition}, $self->{factionindex}, $self->{rank},
+			     pack("SC6L", $self->{level}, $self->{disposition}, $self->{faction}, $self->{rank},
 				  $self->{unk1}, $self->{unk2}, $self->{unk3},  $self->{gold});
 		     }
 		     return($self);
@@ -2461,39 +2266,43 @@ my @RECDEFS =
 		 #fieldnames => sub { grep {!/^_/} keys %{$_[0]}; }, # NOTYET check this works (and implement ordering)
 		 tostr => sub {
 		     my($self) = @_;
-		     my $factionindex = $self->{factionindex};
+		     my $faction = $self->{faction};
 		     my $rank = $self->{rank};
+		     #if (defined($FACTION_INDEX{$self->{faction}})) {
+		     #$faction = $FACTION_INDEX{$self->{faction}};
+		     #$rank = $FACTION_RANK{$faction}->[$self->{rank}];
+		     #}
 		     if (exists $self->{str}) { # long form
 			 my $skills = "";
 			 my $n = 0;
 			 foreach my $skill (sort values %SKILL) {
 			     next if ($skill eq 'None');
-			     $skills .= (($n++ % 6) == 0) ? "\n\t" : "  ";
-			     $skills .= "$skill:$self->{lc($skill)}";
+			     $skills .= "\n\t\t" if (($n++ % 7) == 0);
+			     $skills .= " $skill: $self->{lc($skill)}";
 			 }
-			 sprintf "Level:%d\n\tStr:%d  Int:%d  Wil:%d  Agi:%d  Spd:%d  End:%d  Per:%d  Lck:%d\n\tReputation:%d  Health:%d  Magicka:%d  Fatigue:%d  Disposition:%d\n\tFactionIndex:%s  Rank:%s  Gold:%d\n\t(Skills):$skills",
+			 sprintf "Level:%d  Str:%d  Int:%d  Wil:%d  Agi:%d  Spd:%d  End:%d  Per:%d  Lck:%d\n\t\tRep:%d  Health:%d Magicka:%d  Fatigue:%d  Disp:%d  Faction:%s  Rank:%s  Gold:%d\n\t\tSkills:$skills",
 			     $self->{level}, $self->{str}, $self->{int}, $self->{wil}, $self->{agi}, $self->{spd},
-				 $self->{end}, $self->{per}, $self->{lck}, $self->{reputation}, $self->{health}, $self->{magicka},
-				     $self->{fatigue}, $self->{disposition}, $factionindex, $rank, $self->{gold};
+				 $self->{end}, $self->{per}, $self->{lck}, $self->{rep}, $self->{health}, $self->{magicka},
+				     $self->{fatigue}, $self->{disposition}, $faction, $rank, $self->{gold};
 		     } else {	# short form (autocalced)
-			 sprintf "Level:%d  Disposition:%d  FactionIndex:%s  Rank:%s  Gold:%d",
-			     $self->{level}, $self->{disposition}, $factionindex, $rank, $self->{gold};
+			 sprintf "Level:%d  Disposition:%d  Faction:%s  Rank:%s  Gold:%d",
+			     $self->{level}, $self->{disposition}, $faction, $rank, $self->{gold};
 		     }
 		 }
 		}],
 	       [RNAM => [["race", "Z*"]]],
 	       [SCRI => [["script", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [PCDT => [			# ess, single record, no id
 	       [AADT => @RD_Unknown],
 	       [ANIS => @RD_Unknown],
 	       [BNAM => [["birthsign", "Z*"]]],
 	       [CNAM => @RD_Unknown],
 	       [DNAM => [["dialog_topic", "Z*"]]],
-	       [ENAM => [(["unknown_#", "l"]) x 2]],
-	       [FNAM => [["long_#", "l"], ["long_#", "l:%-2d"], ["long_#", "l"], ["faction", "Z16"], ["float_#", "f"], ["float_#", "f"], ["long_#", "l"], ["long_#", "l"]]],
-	       [KNAM => [ (["unknown_#", "c"], ["spell_#", ["Z35:%-25s", "a35"]], ["long_#", "l:%d\n\t"]) x 10 ]], # hotkeys
-	       [LNAM => [(["unknown_#", "l"]) x 2]],
+	       [ENAM => [(["unknown_1", "l"]) x 2]],
+	       [FNAM => [["long_1", "l"], ["long_1", "l:%-2d"], ["long_1", "l"], ["faction", "Z16"], ["float_1", "f"], ["float_1", "f"], ["long_1", "l"], ["long_1", "l"]]],
+	       [KNAM => [ (["unknown_1", "c"], ["spell_1", ["Z35:%-25s", "a35"]], ["long_1", "l:%d\n\t"]) x 10 ]], # hotkeys
+	       [LNAM => [(["unknown_1", "l"]) x 2]],
 	       [MNAM => [["mnam", "Z*"]]],
 	       [NAM0 => [["nam0", "Z*"]]],
 	       [NAM1 => [["nam1", "Z*"]]],
@@ -2541,7 +2350,7 @@ my @RECDEFS =
 			  } elsif (lc($p->{color}) eq 'blue') {
 			      $color = 1;
 			  }
-			  $buff .= pack("l3C2H4", $p->{x}, $p->{y}, $p->{z}, $color, $p->{nconn}, $p->{unk});
+			  $buff += pack("l3C2H4", $p->{x}, $p->{y}, $p->{z}, $color, $p->{nconn}, $p->{unk});
 		      }
 		      $self->{_subbuf_} = $buff;
 		      return($self);
@@ -2612,25 +2421,25 @@ my @RECDEFS =
 	       [FNAM => [["name", "Z*"]]],
 	       [ITEX => [["icon", "Z*"]]],
 	       [MODL => [["model", "Z*"]]],
-	       [PBDT => [["weight", "f"], ["value", "L"], ["quality", "f"], ["uses", "L"]]],
+	       [PBDT => [["weight", "f"], ["value", "L"], ["quality", "f"], ["uses", "L"]], { rdflags => [qw(mergeable)] }],
 	       [SCRI => [["script", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [PROJ => [			# projectiles (at least those in-flight at time of save)
 	       [PNAM => [
-			 ["unknown_#", "H8"],
+			 ["unknown_1", "H8"],
 			 ["speed", "f"],
-			 ["unknown_#", "H8"],
-			 ["unknown_#", "H8"],
+			 ["unknown_1", "H8"],
+			 ["unknown_1", "H8"],
 			 ["flight_time", "f"],
-			 ["unknown_#", "H8"],
-			 ["unknown_#", "H8"],
+			 ["unknown_1", "H8"],
+			 ["unknown_1", "H8"],
 			 ["speed_x", "f"],
 			 ["speed_y", "f"],
 			 ["speed_z", "f"],
 			 ["x", "f"],
 			 ["y", "f"],
 			 ["z", "f"],
-			 ["unknown_#", "H72"],
+			 ["unknown_1", "H72"],
 			 ["shooter", "Z32"],
 			 ["ammo", "Z32"],
 			 ["weapon", "Z32"],
@@ -2647,8 +2456,8 @@ my @RECDEFS =
 	       [FNAM => [["name", "Z*"]]],
 	       [NPCS => [["spell", ["Z32", "a32"]]]], # Spells
 	       [RADT => [
-			 (["skill_#", "l", { lookup => \%SKILL }], ["bonus_#", "L"]) x 7,
-			 (["attr_male_#", "l", { lookup => \%ATTRIBUTE }], ["attr_female_#", "l", { lookup => \%ATTRIBUTE }]) x 8,
+			 (["skill_1", "l", { lookup => \%SKILL }], ["bonus_1", "L"]) x 7,
+			 (["attr_male_1", "l", { lookup => \%ATTRIBUTE }], ["attr_female_1", "l", { lookup => \%ATTRIBUTE }]) x 8,
 			 ["male_height", "f"], ["female_height", "f"],
 			 ["male_weight", "f"], ["female_weight", "f"],
 			 ["flags", "L", { symflags => \%RADT_FLAGS }]],
@@ -2686,16 +2495,19 @@ my @RECDEFS =
 	       [ACDT => $RD_Actor_Data],
 	       [ACSC => @RD_Unknown],
 	       [ACSL => @RD_Unknown],
-	       [ACTN => [["unknown_#", "L"]]], # Actor Flags ???
-	       [ANIS => [["unknown_#", "H*"]]],
+	       [ACTN => [["unknown_1", "L"]]], # Actor Flags ???
+	       [ANIS => [["unknown_1", "H*"]]],
 	       [APUD => @RD_Unknown],
 	       [CHRD => @RD_long_array_ess],
 	       [CSHN => [["currentstate_hit_target", "Z*"]], { rdflags => [qw(ess)] }],
 	       [CSTN => [["currentstate_target", "Z*"]], { rdflags => [qw(ess)] }],
 	       [DATA => @RD_Unknown],
 	       [FGTN => [["friend_group_member", "Z*"]]],
-	       [FRMR => [], { @RD_reference }],
-	       [ND3D => [["unknown_#", "C"]]],
+	       [FRMR => [], { @RD_reference }], # is startgroup (seems like we get only one) ???
+		   [INTV => [["unknown_1", "L"]]], # it was a warning as unknown subtype /abot
+		   [NAM9 => [["unknown_1", "L"]]], # it was a warning as unknown subtype /abot
+	       [LUAT => [["MWSE_Lua", "Z*"]]], # LUA type from MWSE 2.x /abot
+	       [ND3D => [["unknown_1", "C"]]],
 	       [STPR => @RD_Unknown],
 	       [TGTN => [["target_group_member", "Z*"]]],
 	       [WNAM => [["readied_spell", "Z*"]]],
@@ -2760,20 +2572,20 @@ my @RECDEFS =
 		 },
 		}],
 	       [WNAM => [["name", "L"]], { rdflags => [qw(ess)] }],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [REPA => [
 	       [NAME => [["id", "Z*"]]],
 	       [FNAM => [["name", "Z*"]]],
 	       [ITEX => [["icon", "Z*"]]],
 	       [MODL => [["model", "Z*"]]],
-	       [RIDT => [["weight", "f"], ["value", "L"], ["uses", "L"], ["quality", "f"]]],
+	       [RIDT => [["weight", "f"], ["value", "L"], ["uses", "L"], ["quality", "f"]], { rdflags => [qw(mergeable)] }],
 	       [SCRI => [["script", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [SCPT => [
 	       [SCHD => [["id", ["Z32", "a32"]], ["num_shorts", "L"], ["num_longs", "L"], ["num_floats", "L"],
 			 ["data_size", "L"], ["local_var_size", "L"]]],
 	       [RNAM => [["runflags", "H*"]], { rdflags => [qw(ess)] }],
-	       [SCDT => [["bytecode", "H*:%.0s (compiled script code)"]]],
+	       [SCDT => [["bytecode", "H*:(compiled script code)"]]],
 	       [SCTX => [["script_text", "a*"]],
 		{ tostr => sub {
 		      my $str = $_[0]->{script_text};
@@ -2795,7 +2607,7 @@ my @RECDEFS =
 	       [DESC => @RD_Description],
 	       [SKDT => [["attribute", "l", { lookup => \%ATTRIBUTE }],
 			 ["specialization", "L", { lookup => \%SPECIALIZATION }],
-			 (["use_value_#", "f"]) x 4], # TBD check
+			 (["use_value_1", "f"]) x 4],
 	       { tostr => sub {
 		     my($self) = @_;
 		     my $str = sprintf("Attribute:(%s)  Specialization:(%s)",
@@ -2808,7 +2620,7 @@ my @RECDEFS =
 		     }
 		     $str;
 		 }}],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [SNDG => [
 	       [NAME => [["id", "Z*"]]],
 	       [CNAM => [["creature_id", "Z*"]]],
@@ -2825,26 +2637,28 @@ my @RECDEFS =
 		 }
 	       }],
 	       [FNAM => [["filename", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [SPEL => [
 	       [NAME => [["id", "Z*"]]],
 	       [ENAM => @RD_Enchantment],
 	       [FNAM => [["name", "Z*"]]],
 	       [SPDT => [["type", "L", { lookup => \%SPEL_TYPE }], ["Spell_Cost", "L"],
-			 ["flags", "L", { symflags => \%SPEL_FLAGS }]]],
-	      ]],
+			 ["flags", "L", { symflags => \%SPEL_FLAGS }]],
+		{
+		 rdflags => [qw(mergeable)] }],
+	      ], { rdflags => [qw(mergeable)] }],
      [SPLM => [			# ess, single record, no id
-	       [NAME => [["name", "L"]]],
-	       [CNAM => [["unknown_#", "L"], ["unknown_#", "Z*"]]],
-	       [NAM0 => [["unknown_#", "C"]]],
-	       [NPDT => [["name", ["Z32", "a32"]], ["unknown_#", "H16"], ["magnitude", "l"],
-			 ["seconds_active", "f"], ["long_#", "l"], ["long_#", "l"]]],
-	       [SPDT => [["type", "L", { lookup => \%SPLM_TYPE }], ["name", ["Z40", "a40"]], ["long_#", "L"], ["long_#", "L"],
-			 ["caster", ["Z32", "a32"]], ["item", ["Z32", "a32"]], ["long_#", "L"], ["unknown_#", "H80"]]],
+	       [NAME => [["name", "L"]], { rdflags => [qw(startgroup)] }],
+	       [CNAM => [["unknown_1", "L"], ["unknown_1", "Z*"]]],
+	       [NAM0 => [["unknown_1", "C"]]],
+	       [NPDT => [["name", ["Z32", "a32"]], ["unknown_1", "H16"], ["magnitude", "l"],
+			 ["seconds_active", "f"], ["long_1", "l"], ["long_1", "l"]]],
+	       [SPDT => [["type", "L", { lookup => \%SPLM_TYPE }], ["name", ["Z40", "a40"]], ["long_1", "L"], ["long_1", "L"],
+			 ["caster", ["Z32", "a32"]], ["item", ["Z32", "a32"]], ["long_1", "L"], ["unknown_1", "H80"]]],
 	       [TNAM => [["target", "Z*"]]],
-	       [VNAM => [["unknown_#", "L"]]],
-	       [XNAM => [["unknown_#", "C"]]],
-	       [INAM => [["unknown_#", "H10"], ["name", "Z23"], ["unknown_#", "H*"]]],
+	       [VNAM => [["unknown_1", "L"]]],
+	       [XNAM => [["unknown_1", "C"]]],
+	       [INAM => [["unknown_1", "H10"], ["name", "Z23"], ["unknown_1", "H*"]]],
 	      ], { id => sub {'()'},
 		   rdflags => [qw(ess)] }],
      [SSCR => [
@@ -2854,7 +2668,7 @@ my @RECDEFS =
      [STAT => [
 	       [NAME => [["id", "Z*"]]],
 	       [MODL => [["model", "Z*"]]],
-	      ]],
+	      ], { rdflags => [qw(mergeable)] }],
      [STLN => [			# stolen items
 	       [NAME => [["id", "Z*"]]],
 	       [FNAM => [["owner_faction", "Z*"]]],
@@ -2875,7 +2689,7 @@ my @RECDEFS =
 				$author =~ s!\000+$!!;
 				sprintf(qq{${MARGIN}Version:$ver  Is_Master:%s  Author:"%s"\n${MARGIN}Description:"%s"\n${MARGIN}N_Records:%d}, ($self->{is_master}) ? "True" : "False", $author, $description, $self->{n_records}); },
 		}],
-	       [MAST => [["master", "Z*"]]],
+	       [MAST => [["master", "Z*"]], { rdflags => [qw(startgroup)] }],
 	       [DATA => [],
 		{
 		 decode => sub {
@@ -2902,17 +2716,17 @@ my @RECDEFS =
 		     return("Length:$self->{length}");
 		 },
 		}],
-	       [GMDT => [["unknown_#", "H48"], ["current_cell", ["Z64", "a64"]], ["unknown_#", "L"], ["pc_name", ["Z32", "a32"]]],
+	       [GMDT => [["unknown_1", "H48"], ["current_cell", ["Z64", "a64"]], ["unknown_1", "L"], ["pc_name", ["Z32", "a32"]]],
 		{ rdflags => [qw(ess)] }],
-	       [SCRD => [(["unknown_#", "L"]) x 5], { rdflags => [qw(ess)] }],
+	       [SCRD => [(["unknown_1", "L"]) x 5], { rdflags => [qw(ess)] }],
 	       [SCRS => [["screenshot", "H*"]], { rdflags => [qw(ess)] }],
 	      ], {
 		  id => sub { '()' },
 		 }],
      [VFXM => [			# Visual FX (ess, single record, no id) ???
-	       [VNAM => [(["unknown_#", "L"]) x 6,
-			 ["short", "S"], ["unknown_#", "H44"],
-			 ["name_#", ["Z36", "a36"]], ["name_#", ["Z68", "a68"]]]],
+	       [VNAM => [(["unknown_1", "L"]) x 6,
+			 ["short", "S"], ["unknown_1", "H44"],
+			 ["name_1", ["Z36", "a36"]], ["name_1", ["Z68", "a68"]]]],
 	      ], { id => sub {'()'},
 		   rdflags => [qw(ess)] }],
      [WEAP => [
@@ -2926,14 +2740,15 @@ my @RECDEFS =
 			 ["health", "S:%d\n\t"], ["speed", "f"],
 			 ["reach", "f"], ["enchantment", "S:%d\n\t"], ["chop_min", "C"], ["chop_max", "C"],
 			 ["slash_min", "C"], ["slash_max", "C:%d\n\t"], ["thrust_min", "C"], ["thrust_max", "C"],
-			 ["flags", "L", { symflags => \%WEAPON_FLAGS }]]],
-	      ]],
+			 ["flags", "L", { symflags => \%WEAPON_FLAGS }]],
+		{ rdflags => [qw(mergeable)] }],
+	      ], { rdflags => [qw(mergeable)] }],
     );				# End of @RECDEFS
 
+my %MERGE_OBJECT_TYPE;	    # rectypes of objects that will be merged in multipatch
 my %NAMED_TYPE;		    # those rectypes that use NAME subrec for their ID
-my %FORMAT_SUBTYPE;	    # map unique fieldnames to a rectype:subrectype
 my %NO_ID_TYPE =	    # rectypes that do not have an ID
-    map {$_,1} (qw(TES3 FMAP GAME PCDT SPLM VFXM ));
+	map {$_,1} (qw(TES3 FMAP GAME PCDT SPLM VFXM ));
 
 # TES3::Record->new_from_recbuf "factory' for creating instances of the various record types
 sub new_from_recbuf {
@@ -2959,49 +2774,29 @@ sub new_from_input {
     }
     if ($n_read != $hdr_size) {
 	my $inp_offset = tell($fh) - $n_read;
-	# TBD: this condition indicates file corruption. it would be good to attempt to rewind and scan ahead for next viable record
-	abort(qq{new_from_input(): Read Error on header (at byte: $inp_offset): asked for $hdr_size bytes, got $n_read});
+    abort(qq{new_from_input(): Read Error ($plugin header at byte: $inp_offset): asked for $hdr_size bytes, got $n_read});
     }
     # I suspect $reclen2 is the high word of a 64-bit double long, it is effectively unused.
     my($rectype, $reclen, $reclen2, $hdrflags) = unpack("a4LLL", $rec_hdr);
     return(undef) unless defined $rectype;
     if (not $TES3::Record::RECTYPES{$rectype}) {
 	my $inp_offset = tell($fh) - $n_read;
-	err(qq{new_from_input(): Type Error (at byte: $inp_offset): Unknown Record Type: "$rectype"});
-	# create a phony object for unknown record
-	no strict "refs";
-	my $method;
-	$method = "${rectype}::decode";
-	*$method = sub { return($_[0]); };
-	$method = "${rectype}::id";
-	*$method = sub { return("(unknown)"); };
-	$method = "${rectype}::tostr";
-	*$method = sub { return(""); };
+    abort(qq{new_from_input(): Error ($plugin at byte: $inp_offset): Invalid Record Type: "$rectype"});
     }
     if (defined($expected_type) and $expected_type ne $rectype) {
 	my $inp_offset = tell($fh) - $n_read;
-	msg(qq{new_from_input(): Type Error (at byte: $inp_offset): Expected: "$expected_type", got: "$rectype"});
+    abort(qq{new_from_input(): Error ($plugin at byte: $inp_offset): Expected: "$expected_type", got: "$rectype"});
     }
     my $recbuf = "";
     $n_read = read($fh, $recbuf, $reclen);
     if ($n_read != $reclen) {
 	my $inp_offset = tell($fh) - $n_read;
-	# TBD: this condition indicates file corruption. it would be good to attempt to rewind and scan ahead for next viable record
-	abort(qq{new_from_input(): Read Error (at byte: $inp_offset, rec_type="$rectype"): asked for $reclen bytes, got $n_read});
+    abort(qq{new_from_input(): Read Error ($plugin record at byte: $inp_offset, rec_type="$rectype"): asked for $reclen bytes, got $n_read});
     }
     return(bless({ _rectype_ => $rectype,
 		   _hdrflags_ => $hdrflags,
 		   _recbuf_ => $recbuf }, $rectype)); # return a TES3 object
 } # new_from_input
-
-# tr->copy()
-# return a copy of current existing record (tr)
-sub copy {
-    my($self) = @_;
-    my $new_tr = TES3::Record->new_from_recbuf($self->rectype, $self->recbuf, $self->hdrflags);
-    $new_tr->decode;
-    return($new_tr);
-}
 
 # tr->write_rec()
 sub write_rec {
@@ -3069,12 +2864,12 @@ sub decode {
 	my $package = "${rectype}::${subtype}";
 	bless($tsr, $package);
 	$CURRENT_GROUP = $subtype
-	    if ($TYPE_INFO{$rectype}->{group}->{$subtype}->{start});
+	    if ($RDFLAGS{$package}->{startgroup});
 	eval { $tsr->decode($subbuf, $self); };
 	if ($@) {
 	    if ($@ =~ /Can't locate object method/) {
 		# magically create subrecord class for unknown subtypes
-		err("Encountered unknown subtype: ${rectype}::${subtype}");
+		dbg("Encountered unknown subtype: ${rectype}::${subtype}");
 		no strict "refs";
 		# tsr->tostr
 		my $method = "${package}::tostr";
@@ -3235,7 +3030,7 @@ sub split_groups {
     foreach my $tsr ($self->subrecs()) {
 	my $package = ref($tsr);
 	dbg("split_groups: package is $package") if (DBG);
-	if ($TYPE_INFO{$tsr->rectype}->{group}->{$tsr->subtype}->{start}) {
+    if ($RDFLAGS{$package}->{startgroup}) {
 	    push(@groups, [@this_group]);
 	    @this_group = ();
 	}
@@ -3258,7 +3053,7 @@ sub flags_tostr {
 	    push(@list, $name);
 	}
     }
-    return($flag_cache{$flags.$flagdefs} = sprintf("0x%04x", $flags)." (".join(', ', sort @list).")");
+    return($flag_cache{$flags.$flagdefs} = sprintf("0x%04x", $flags)." (".join(', ',@list).")");
 }
 
 sub color_tostr {
@@ -3329,7 +3124,7 @@ sub gen_subrec_methods {
 	my $decode_pack_format;
 	my $encode_pack_format;
 	my @fieldnames;
-	my %suffix_index;
+    my %seen;
 	my @formats;
 	my $lookup;
 	my $symflags;
@@ -3338,10 +3133,12 @@ sub gen_subrec_methods {
 		my($fieldname, $fmt, $opt) = @{$_};
 		$fieldname = lc($fieldname);
 		$NAMED_TYPE{$rectype} = 1 if (($subtype eq 'NAME') and ($fieldname eq 'id'));
-		if (my($basename) = ($fieldname =~ /^(.+)_\#$/)) { # when fieldname ends in: _#
-		    # make a unique numbered fieldname for this record.
-		    $fieldname = $basename . "_" . ++$suffix_index{$basename};
+		# make a unique numbered fieldname
+		while (exists $seen{$fieldname}) {
+		    $fieldname =~ s/_\d+$//; # remove _(indexed) suffix
+		    $fieldname .= '_' . ++$seen{$fieldname};
 		}
+		$seen{$fieldname} ||= 1;
 		push(@fieldnames, $fieldname);
 		my $pfmt;
 		my $custom_format;
@@ -3425,7 +3222,7 @@ sub gen_subrec_methods {
 #		$print_format = join("  ", @formats);
 #	    }
 	    if (my $ncol = $COLUMNS{$package}) {
-		my $width = int(78 / $ncol);
+		my $width = int(70 / $ncol);
 		my $n = 0;
 		my @columnized_lines;
 		my @line;
@@ -3434,13 +3231,6 @@ sub gen_subrec_methods {
 		    my $fname = shift @fnames;
 		    my $fwidth = $width - length($fname);
 		    $fmt =~ s/%\d*/\%${fwidth}/;
-		    if ($FORMAT_INFO{$rectype}->{$subtype}->{$fname}->{BOL}) {
-			if (@line) {
-			    push(@columnized_lines, join("  ", @line));
-			    @line = ();
-			    $n = 0;
-			}
-		    }
 		    push(@line, $fmt);
 		    if (++$n == $ncol) {
 			push(@columnized_lines, join("  ", @line));
@@ -3502,17 +3292,16 @@ sub gen_subrec_methods {
 		*$method = sub {
 		    use strict "refs";
 		    my($self) = @_;
-		    #warn qq{FORMAT: $print_format\n\tfieldnames: @fieldnames\n};
 		    sprintf($print_format, map { $self->{$_} } @fieldnames);
 		};
 	    }
 	}			# tsr->tostr
 
-	# tsr->fieldnames
-	unless ($package->can('fieldnames')) {
-	    $method = "${package}::fieldnames";
-	    *$method = sub { @fieldnames; };
-	}
+#	# tsr->fieldnames()   NOTYET
+#	unless ($package->can('fieldnames')) {
+#	    $method = "${package}::fieldnames";
+#	    *$method = sub { @fieldnames; };
+#	}
     } 				# finished processing list of subrec fields
 
     no strict "refs";
@@ -3558,8 +3347,18 @@ sub gen_class {
 	@{"${rectype}::ISA"} = qw(TES3::Record);
     };
     foreach my $defref (@recdefs) {
-	gen_subrec_methods($rectype, @{$defref});
+	if (ref($defref->[0]) eq 'ARRAY') {
+	    abort("($rectype) Hey man, I thought we switched to using 'startgroup'");
+	    my @group;
+	    foreach (@{$defref}) {
+		my($subtype, $subdefref, $suboptref) = @{$_};
+		push(@group, $subtype);
+		gen_subrec_methods($rectype, $subtype, $subdefref, $suboptref);
+	    }
+	} else {
+	    gen_subrec_methods($rectype, @{$defref});
     }
+	}
     gen_subrec_methods($rectype, DELE => [["DELETED", "L"]]); # TBD is this a reference number?
 
     no strict "refs";
@@ -3602,7 +3401,7 @@ sub gen_class {
     };
 
     # $tr->append(@SUBRECS)
-    # appends given subrecords and sets _modified_ flag
+    # appends given sub-records and sets _modified_ flag
     $method = "${rectype}::append";
     *$method = sub {
 	use strict "refs";
@@ -3631,22 +3430,22 @@ sub gen_class {
 	};
     }
 
-    # $tr->hdrflags() - get/set _hdrflags_
+    # $tr->hdrflags()
     unless ($rectype->can('hdrflags')) {
 	$method = "${rectype}::hdrflags";
-	*$method = sub { ($_[1]) ? $_[0]->{_hdrflags_} = $_[1] : $_[0]->{_hdrflags_}; };
+    *$method = sub { $_[0]->{_hdrflags_}; };
     }
 
-    # tr->id() - get/set _id_
+    # tr->id()
     unless ($rectype->can('id')) {
 	$method = "${rectype}::id";
-	*$method = sub { ($_[1]) ? $_[0]->{_id_} = $_[1] : $_[0]->{_id_} };
+    *$method = sub { $_[0]->{_id_} };
     }
 
-    # tr->recbuf() - get/set _recbuf_
+    # tr->recbuf()
     unless ($rectype->can('recbuf')) {
 	$method = "${rectype}::recbuf";
-	*$method = sub { ($_[1]) ? $_[0]->{_recbuf_} = $_[1] : $_[0]->{_recbuf_}; };
+    *$method = sub { $_[0]->{_recbuf_}; };
     }
 
     # tr->reclen()
@@ -3677,73 +3476,36 @@ sub gen_class {
 	    my($self) = @_;
 	    my $dialstr = (($rectype eq 'INFO') and (defined $CURRENT_DIAL)) ? " ($CURRENT_DIAL)" : '';
 	    qq{Record: $rectype "@{[$self->id]}"$dialstr Flags:@{[$self->hdrflagstr()]}\n} .
-		join("\n", map { (($TYPE_INFO{$rectype}->{group}->{$_->subtype}->{start}) ?
-				  $GROUPMARGIN : $MARGIN).$_->subtype().": ".$_->tostr() } @{$self->{SL}});
+		join("\n", map { (($RDFLAGS{${rectype}."::".$_->subtype()}->{startgroup}) ? $GROUPMARGIN : $MARGIN).$_->subtype().": ".$_->tostr() } @{$self->{SL}});
 	};
     }
 
     # $tr->get() (actually "getfirst" might be more appropriate) (maybe getfirstfield)
+    # TBD - the get() function should really be exactly like ->set(), except it returns
+	# current matching tsrs instead of setting it.
     $method = "${rectype}::get";
     *$method = sub {
 	use strict "refs";
 	my($self, $subtype, $field) = @_;
-	$subtype = uc($subtype);
 	return(undef) unless (defined $self->{SH}->{$subtype});
 	if (defined $field) {
 	    # return a field
-	    return($self->{SH}->{$subtype}->[0]->{lc($field)});
+	    return($self->{SH}->{$subtype}->[0]->{$field});
 	} else {
 	    # return entire subrec
 	    return($self->{SH}->{$subtype}->[0]);
 	}
-    };
-
-    # getfield is a convenience function that remembers seen subtypes for
-    # given field names, so you can get a value from a record based on only
-    # its field name without having to remember the subrecord type
-    $method = "${rectype}::getfield";
-    *$method = sub {
-	use strict "refs";
-	my($self, $field) = @_;
-	$field = lc($field);
-	if (my($subtype, $fieldname) = ($field =~ /^([^:])+:([^:]+)$/)) {
-	    # explicit subtype: given
-	    return($self->{SH}->{uc($subtype)}->[0]->{$fieldname});
-	} elsif (defined($FORMAT_SUBTYPE{$rectype}->{$field})) {
-	    return($self->{SH}->{$FORMAT_SUBTYPE{$rectype}->{$field}}->[0]->{$field});
-	} else {
-	    my @subtypes;
-	    foreach my $subtype (keys %{$self->{SH}}) {
-		if (defined($self->{SH}->{$subtype}->[0]->{$field})) {
-		    push(@subtypes, $subtype);
-		}
-	    }
-	    if (scalar(@subtypes) == 1) {
-		# found unique field
-		my $subtype = shift(@subtypes);
-		$FORMAT_SUBTYPE{$rectype}->{$field} = $subtype;
-		#print "DBG: ${rectype}::$subtype field=$field\n";
-		return($self->{SH}->{$subtype}->[0]->{$field});
-	    } elsif (@subtypes) {
-		msgonce(qq{$rectype: Specified field name: "$field" is not unique. It occurs in: [@subtypes]
-You could try: "$subtypes[0]:$field"});
-	    }
-	}
-	msgonce(qq{$rectype: Unknown field name: "$field"});
-	return("");
-    };
+	};
 
     # $tr->getall() (maybe getallfields)
     $method = "${rectype}::getall";
     *$method = sub {
 	use strict "refs";
 	my($self, $subtype, $field) = @_;
-	$subtype = uc($subtype);
-	$field = lc($field);
 	return() unless (defined $self->{SH}->{$subtype});
 	if (defined $field) {
 	    # return matching field from all subrecs of type
-	    return(map { $_->{lc($field)} } @{$self->{SH}->{$subtype}});
+	    return(map { $_->{$field} } @{$self->{SH}->{$subtype}});
 	} else {
 	    # return all complete subrecs of given type
 	    return(@{$self->{SH}->{$subtype}});
@@ -3756,99 +3518,14 @@ sub generate_classes {
     gen_class($_) foreach (@RECDEFS);
 }
 
-##################################################
-# OBJECT MERGING METHODS
-package LEVC;
-our %user_delete_creature;
-sub merge {
-    my($self, $self_plugin, $merge_list) = @_;
-    my($last_plugin, $last_tr) = @{$merge_list->[-1]};
-    # strategy: last guy wins for List Flags
-    my $last_list_flags = $last_tr->get('DATA', 'list_flags');
-    # strategy: last guy wins for "Chance_None"
-    my $last_chance = $last_tr->get('NNAM', 'chance_none');
-    # interpret the initial leveled list definition
-    my %levlist;
-    my $firstdef;
-    my $creature_id;
-    foreach my $tsr ($self->subrecs) {
-	my $subtype = $tsr->subtype;
-	if ($subtype eq 'CNAM') {
-	    $creature_id = $tsr->{creature_id};
-	} elsif ($subtype eq 'INTV') {
-	    # increment count of times this id appears at this level
-	    $firstdef->{$creature_id}->{$tsr->{level}}++;
-	}
-    }
-    foreach my $creature_id (keys %{$firstdef}) {
-	foreach my $level (keys %{$firstdef->{$creature_id}}) {
-	    $levlist{$creature_id}->{$level} = $firstdef->{$creature_id}->{$level};
-	}
-    }
-    foreach (@{$merge_list}) {
-	my($plugin, $tr) = @{$_};
-	abort(qq{LEVC::merge: tried to merge "$tr->{_id_}" into "$self->{_id_}"\n})
-	    if ($self->{_id_} ne $tr->{_id_});
-	my $element_id;
-	my $currdef;
-	# For each item in list per plugin
-	foreach my $tsr ($tr->subrecs) {
-	    my $subtype = $tsr->subtype;
-	    if ($subtype eq 'CNAM') {
-		$creature_id = $tsr->{creature_id};
-	    } elsif ($subtype eq 'INTV') {
-		# increment count of times this id appears at this level
-		$currdef->{$creature_id}->{$tsr->{level}}++;
-	    }
-	}
-	# Additions/Changes to list
-	foreach my $element_id (keys %{$currdef}) {
-	    foreach my $level (keys %{$currdef->{$element_id}}) {
-		if ((not defined $firstdef->{$element_id}) or
-		    (not defined $firstdef->{$element_id}->{$level}) or
-		    ($currdef->{$element_id}->{$level} != $firstdef->{$element_id}->{$level})) {
-		    $levlist{$element_id}->{$level} = $currdef->{$element_id}->{$level};
-		}
-	    }
-	}
-	# Deletions from original definition
-	foreach my $element_id (keys %{$firstdef}) {
-	    if (not defined $currdef->{$element_id}) {
-		delete $levlist{$element_id};
-	    } else {
-		foreach my $level (keys %{$firstdef->{$element_id}}) {
-		    if (not defined $currdef->{$element_id}->{$level}) {
-			delete $levlist{$element_id}->{$level};
-		    }
-		}
-	    }
-	}
-    }
-#    my $newrec = [[NAME => { id => $id }],
-#		  [DATA => { list_flags => $last_list_flags }],
-#		  [NNAM => { chance_none => $last_chance }],
-#		  [INDX => { item_count => $indx }]];
-#    my $merged_tr = LEVC->new($newrec);
-#    return($merged_tr);
-} # LEVC::merge
-
-package LEVI;
-our %user_delete_item;
-sub merge {
-    my($self, $merge_list) = @_;
-    my %delete_item = map { lc, 1 } @opt_multipatch_delete_item;
-} # LEVI::merge
-
-
 ### END OF TES3::Record
-##################################################
 
 ### MAIN
 
 package main;
 
 BEGIN {
-    Util->import(qw(abort assert dbg err mkpath msg msgonce prn RELOAD));
+	Util->import(qw(abort assert dbg err mkpath msg prn RELOAD));
 }
 
 TES3::Record::generate_classes();
@@ -4676,62 +4353,6 @@ my @lint_bethesda_doors =
      'smora_fara_door',
      'vivec_grate_door_02');
 
-# JMS - "do" seems to behave differently under Windows now, so this code is busted
-#	unless (do $program_file) {	# load perl file --- BUSTED!
-#	    abort("Error processing $program_file ($@)") if ($@);
-#	}
-sub load_perl {
-    my($program_file) = (@_);
-    if ($program_file) {
-	dbg("loading program-file: $program_file") if (DBG);
-	my $prog;
-	if (open(PROG, "<", $program_file)) {
-	    local $/ = undef;
-	    $prog = join("", <PROG>);
-	    close(PROG);
-	} else {
-	    abort(qq{Error opening "$program_file" ($!)});
-	}
-	my $value = eval($prog);
-	abort("Error processing $program_file ($@)") if ($@);
-	return($value);
-    }
-}
-
-my $Usage1 = qq{Usage: tes3cmd COMMAND OPTIONS plugin...
-
-VERSION: $::VERSION
-
-tes3cmd is a powerful low-level command line tool that can examine, edit, and
-delete records from a TES3 plugin for Morrowind. It can also generate various
-patches and clean plugins too.
-
-COMMANDS
-};
-my $Usage2 = qq{
-FOR HELP ON INDIVIDUAL COMMANDS:
-
-  tes3cmd help <command>
-
-GENERAL HELP:
-
-OPTIONS given to commands may be abbreviated, as long as the abbreviations are
-unique.
-
-Commands mostly for Morrowind Players: "clean", "header --synchronize". and
-"multipatch" (also see: the "fixit" command which rolls these together).
-
-Commands mostly for Modders: "dump", "esp/esm", "modify", and "delete".
-
-tes3cmd uses Perl regular expressions for string matching, the full
-documentation can be found here:
-  http://perldoc.perl.org/perlre.html
-You should at least be aware that the characters "\\.?*+|^\$()[]{}" have
-special meaning in a regular expression and that they are unlike characters
-used for matching on a Windows command line.
-};
-
-
 ### MAIN COMMAND DISPATCH TABLE
 my %COMMAND;
 %COMMAND =
@@ -4766,7 +4387,6 @@ just prints current active load order.
      { description => qq{Clean plugins of Evil GMSTs, junk cells, and more},
        options => [@STDOPT,
 		   @MODOPT,
-		   'active',
 		   'all'           => \$opt_clean_all,
 		   'ignore-plugin=s@',
 		   'instances'     => \$opt_clean_instances,
@@ -4796,14 +4416,9 @@ OPTIONS:
  --debug
 	turn on debug messages
 
- --active
-	only process specified plugins that are active. If none specified,
-	process all active plugins. Plugins will be processed in the same
-	order as your normal game load order.
-
  --backup-dir
 	where backup files get stored. The default is:
-	"morrowind/tes3cmd/backups"
+	"Data Files/tes3cmd/backups"
 
  --cell-params
 	clean cell subrecords AMBI,WHGT duped from masters
@@ -4896,7 +4511,7 @@ Junk Cells (--junk-cells)
 Cache Files Feature
 
   tes3cmd will normally create cached data files for your masters in the
-  subdirectory: "morrowind/tes3cmd/cache". If you do not wish tes3cmd to create
+  subdirectory: "Data Files/tes3cmd". If you do not wish tes3cmd to create
   cache files, you can use the --no-cache option. (But it is recommended you
   do use them for speedier cleaning).
 
@@ -4939,7 +4554,6 @@ tes3cmd common "my plugin.esp" "Morrowind.esm"
      { description => qq{Delete records/subrecords/object instances from plugin},
        options => [@STDOPT,
 		   @MODOPT,
-		   'active',
 		   'ignore-plugin=s@',
 		   'instance-match=s',
 		   'instance-no-match=s',
@@ -4948,10 +4562,10 @@ tes3cmd common "my plugin.esp" "Morrowind.esm"
 		   'flag=s@',
 		   'id=s@',
 		   'interior',
-		   'match=s@',
-		   'no-match|M=s@',
+		   'match=s',
+		   'no-match|M=s',
 		   'sub-match=s',
-		   'sub-no-match=s',
+		   'sub-no-match|M=s',
 		   'type=s@'],
        process => \&cmd_delete,
        usage => qq{Usage: tes3cmd delete OPTIONS plugin...
@@ -4960,14 +4574,9 @@ OPTIONS:
  --debug
 	turn on debug messages
 
- --active
-	only process specified plugins that are active. If none specified,
-	process all active plugins. Plugins will be processed in the same
-	order as your normal game load order.
-
  --backup-dir
 	where backup files get stored. The default is:
-	"morrowind/tes3cmd/backups"
+	"Data Files/tes3cmd/backups"
 
  --exact-id* <id-string>
 	only delete records whose ids exactly match given <id-string>
@@ -5001,16 +4610,12 @@ OPTIONS:
  --interior
 	only delete if record is an Interior CELL
 
- --match* <regex>
+ --match <regex>
 	only delete records that match given regular expression <regex>
-	If more than one of these switches is supplied, ALL must match
-	for a record to be processed.
 
- --no-match*|--M* <regex>
+ --no-match <regex>
 	only delete records that do not match given regular expression
 	<regex>
-	If more than one of these switches is supplied, if ANY match,
-	that record will be skipped.
 
  --sub-match <regex>
 	only delete the subrecords that match <regex>
@@ -5031,13 +4636,13 @@ cell records. You can really damage things with this command, so be careful!
 
 One thing you should be extra careful with is deleting objects from cells.
 When objects from a master are "moved" by a plugin, a MVRF group appears
-before the object instance that starts with a FRMR subrecord. If you really
+before the object instance that starts with a FRMR sub-record. If you really
 want to delete that object, you probably want to delete both the FRMR object
 instance and the preceeding MVRF group. A future version of tes3cmd may handle
 this situation more elegantly.
 
 Note: documentation for regular expressions:
-  http://perldoc.perl.org/perlre.html
+  http://www.perl.com/doc/manual/html/pod/perlre.html
 
 EXAMPLES:
 
@@ -5062,8 +4667,7 @@ tes3cmd delete --type npc_ --match _mca_ --sub-match spell:poisonbloom quicksave
 		   'ignore-type=s@'   => \@opt_diff_ignore_types,
 		   '1-not-2|e1'       => \$opt_diff_1_not_2,
 		   '2-not-1|e2'       => \$opt_diff_2_not_1,
-		   'equal'            => \$opt_diff_equal,
-		   'sortsubrecs'      => \$opt_diff_sortsubrecs,
+		   'equal|eq'         => \$opt_diff_equal,
 		   'types'            => \$opt_diff_types,
 		   'not-equal|ne'     => \$opt_diff_not_equal],
 
@@ -5089,17 +4693,11 @@ OPTIONS:
  --2-not-1|--e2
 	report records in plugin2 that do not exist in plugin1
 
- --equal
+ --equal|--eq
 	report records in plugin1 that are equal in plugin2
 
  --not-equal|--ne
 	report records in plugin1 that are different in plugin2
-
- --sortsubrecs
-	two records being compared may be functionally equivalent but
-	differ because their subrecords are in different order. This
-	switch will first sort subrecords before comparison so
-	subrecord order will not matter for comparison.
 
  Note: starred (*) options can be repeated, and matching of strings is not
  case-sensitive.
@@ -5138,72 +4736,45 @@ tes3cmd diff --not-equal "my plugin1.esp" plugin2.esp
 
      dump =>
      { description => qq{Dump records as text for easy study},
-       options => [@STDOPT,
-		   'active',
-		   'binary',
-		   'exact-id=s@',
-		   'exterior',
-		   'flag=s@',
-		   'format=s@'		  => \@opt_dump_format,
-		   'no-quote'		  => \$opt_dump_no_quote,
-		   'header',
-		   'id=s@',
-		   'ignore-plugin=s@',
-		   'instance-match=s',
-		   'instance-no-match=s',
-		   'interior',
-		   'list',
-		   'match=s@',
-		   'no-banner|B',
-		   'no-match|M=s@',
-		   'wrap',
-		   'raw-with-header=s'   => \$opt_dump_raw_with_header,
-		   'raw=s'               => \$opt_dump_raw,
-		   'separator=s',
-		   'type=s@'],
+    options => [@STDOPT,
+    	    'exact-id=s@',
+            'exterior',
+		    'flag=s@',
+		    'id=s@',
+		    'ignore-plugin=s@',
+		    'instance-match=s',
+		    'instance-no-match=s',
+		    'interior',
+		    'list',
+		    'match=s',
+		    'no-banner|B',
+		    'no-match|M=s',
+		    'wrap',
+		    'raw-with-header=s'   => \$opt_dump_raw_with_header,
+		    'raw=s'               => \$opt_dump_raw,
+		    'separator=s',
+		    'type=s@'],
        preprocess =>  sub {
+	    $opt_dump_raw = $opt_dump_raw_with_header
+		if ($opt_dump_raw_with_header);
+	    abort("did you forget to give a filename for raw output?")
+		if (defined($opt_dump_raw) and $opt_dump_raw =~ /^-/);
 
-	   # translate the obsolete command switches
-	   if ($opt_dump_raw_with_header) {
-	       msg(qq{Note: --raw-with-header is obsolete, you can now use:\n\t--binary --header --output <filename>});
-	       $opt_dump_raw = $opt_dump_raw_with_header;
-	       $opt_dump_header = 1;
-	       $opt_dump_binary = 1;
-	       $opt_output = $opt_dump_raw_with_header;
-	   } elsif ($opt_dump_raw) {
-	       msg(qq{Note: --raw is obsolete, you can now use:\n\t--binary --output <filename>});
-	       $opt_dump_binary = 1;
-	       $opt_output = $opt_dump_raw;
-	   }
-	   abort("did you forget to give a filename for raw output?")
-	       if (defined($opt_dump_raw) and $opt_dump_raw =~ /^-/);
-
-	   # write out the header here as we would like to be able to append to it from multiple input plugins
-	   if ($opt_dump_binary) {
-	       if ($opt_dump_header) {
-		   $DUMP_RAWOUT = open_for_output($opt_output);
-		   print $DUMP_RAWOUT make_header();
-	       } else {
-		   if (-f $opt_output) {
-		       msg(qq{Appending to: "$opt_output"});
-		       $DUMP_RAWOUT = open_for_append($opt_output);
-		   } else {
-		       msg(qq{Creating: "$opt_output"});
-		       $DUMP_RAWOUT = open_for_output($opt_output);
-		   }
-	       }
-	   }
-       },
-
+	    # write out the header here as we would like to be able to append to it from multiple input plugins
+	    $DUMP_RAWOUT = open_for_output($opt_dump_raw)
+		if ($opt_dump_raw);
+	    print $DUMP_RAWOUT make_header()
+		if ($opt_dump_raw_with_header);
+	},
        process => \&cmd_dump,
        postprocess => sub {
-	   if ($opt_dump_binary) {
+	   if ($opt_dump_raw) {
 	       close($DUMP_RAWOUT);
-	       if ($opt_dump_header) {
+	       if ($opt_dump_raw_with_header) {
 		   $opt_header_update_record_count = 1;
-		   update_header($opt_output, [qw(QUIET NOBACKUP)]);
+		   update_header($opt_dump_raw, [qw(QUIET NOBACKUP)]);
 	       }
-	       print "\nRaw records saved in $opt_output\n";
+	       print "\nRaw records saved in $opt_dump_raw\n";
 	   }
        },
        usage => qq{Usage: tes3cmd dump OPTIONS plugin...
@@ -5211,17 +4782,6 @@ tes3cmd diff --not-equal "my plugin1.esp" plugin2.esp
 OPTIONS:
  --debug
 	 turn on debug messages
-
- --active
-	only process specified plugins that are active. If none specified,
-	process all active plugins. Plugins will be processed in the same
-	order as your normal game load order.
-
- --binary
-	output raw binary records. (Default is to output human readable text)
-
- --header
-	output an initial TES3 header record.
 
  --ignore-plugin* <plugin-name>
         skips specified plugin if it appears on command line. plugin name is
@@ -5246,13 +4806,6 @@ OPTIONS:
 	as: (deleted, persistent, ignored, blocked), or via their numeric
 	values (i.e. persistent is 0x400).
 
- --format* <formatstring>
-	Only print out given fields, with fields specified by names enclosed
-	with "%". For example, the NPC_ screen name field would be: \%name\%
-	If multiple formats are given each defines a separate line of output.
-	Output fields are automatically quoted if they contain whitespace.
-	(see also --no-quote).
-
  --id* <id-regex>
 	only process records whose ids match regular expression pattern
 	<id-regex>
@@ -5263,36 +4816,23 @@ OPTIONS:
  --list
 	only list the ids of the records to be dumped, instead of the entire record
 
- --match* <regex>
+ --match <regex>
 	only process records that match given regular expression <regex>
-	If more than one of these switches is supplied, ALL must match
-	for a record to be dumped.
 
- --no-banner|--B
+ --no-banner
 	do not print banner identifying the current plugin
 
- --no-match*|--M* <regex>
+ --no-match <regex>
 	only process records that do not match given regular expression
 	<regex>
-	If more than one of these switches is supplied, if ANY match,
-	that record will be skipped.
-
- --no-quote
-	Turn off automatic quoting of output fields in the --format switches.
-
- --output <filename>
-	Specify the name of the output file where records are dumped.
 
  --wrap
 	Wrap some long fields for more nicely formatted output.
 
  --raw <file>
-	[Obsolete: use --binary --output <file>]
-	dump raw records to <file>, instead of as text. If <file> exists, records
-	are appended to the end.
+	dump raw records to <file>, instead of as text
 
  --raw-with-header <file>
-	[Obsolete: use --binary --header --output <file>]
 	dump raw records with an initial TES3 header record to <file>
 
  --separator <string>
@@ -5314,12 +4854,9 @@ text output can be voluminous. In the text output, a starred subrecord
 indicates it is related to following subrecords.
 
 Note: documentation for regular expressions:
-  http://perldoc.perl.org/perlre.html
+  http://www.perl.com/doc/manual/html/pod/perlre.html
 
 EXAMPLES:
-
-# Print out NPC's by Id and Name and Faction:
-tes3cmd dump --type npc_ --format "\%id\% \%name\% \%faction\%" Morrowind.esm
 
 # List all the records in the plugin, just one per line, by type and ID:
 tes3cmd dump --list "Drug Realism.esp"
@@ -5420,7 +4957,7 @@ OPTIONS:
 
  --backup-dir
 	where backup files get stored. The default is:
-	"morrowind/tes3cmd/backups"
+	"Data Files/tes3cmd/backups"
 
  --hide-backups
 	any created backup files will get stashed in the backup directory
@@ -5444,7 +4981,6 @@ The fixit command does the following operations:
      { description => qq{Read/Write plugin Author/Description, sync to masters...},
        options => [@STDOPT,
 		   @MODOPT,
-		   'active',
 		   'author=s'              => \$opt_header_author,
 		   'description=s'         => \$opt_header_description,
 		   'ignore-plugin=s@',
@@ -5464,17 +5000,12 @@ OPTIONS:
  --debug
 	turn on debug messages
 
- --active
-	only process specified plugins that are active. If none specified,
-	process all active plugins. Plugins will be processed in the same
-	order as your normal game load order.
-
  --author <author>
 	set the Author field to <author>
 
  --backup-dir
 	where backup files get stored. The default is:
-	"morrowind/tes3cmd/backups"
+	"Data Files/tes3cmd/backups"
 
  --description <desc>
 	set the Description field to <desc>
@@ -5547,11 +5078,44 @@ tes3cmd header --synchronize "my plugin.esp"
 	       defined(my $cmd_ref = $COMMAND{$cmd_name})) {
 	       die($cmd_ref->{usage}."\n");
 	   } else {
-	       die(join("",
-			$Usage1,
-			(map { (/^(help|-)/ or (not defined $COMMAND{$_}->{description})) ? "" :
-				  "  $_\n    $COMMAND{$_}->{description}.\n" } (sort keys %COMMAND)),
-			$Usage2));
+	       my $command_list;
+	       foreach (sort keys %COMMAND) {
+		   $command_list .= "  $_\n    $COMMAND{$_}->{description}.\n"
+		       unless (($_ eq 'help') or ($_ =~ /^-/));
+	       }
+	       die <<"EOF";
+Usage: tes3cmd COMMAND OPTIONS plugin...
+
+VERSION: $::VERSION
+
+tes3cmd is a low-level command line tool that can examine, edit, and delete
+records from a TES3 plugin for Morrowind. It can also generate various patches
+and clean plugins too.
+
+COMMANDS
+$command_list
+
+FOR HELP ON INDIVIDUAL COMMANDS:
+
+  tes3cmd help <command>
+
+GENERAL HELP:
+
+OPTIONS given to commands may be abbreviated, as long as the abbreviations are
+unique.
+
+Commands mostly for Morrowind Players: "clean", "header --synchronize". and
+"multipatch" (also see: the "fixit" command which rolls these together).
+
+Commands mostly for Modders: "dump", "esp/esm", "modify", and "delete".
+
+tes3cmd uses Perl regular expressions for string matching, the full
+documentation can be found here:
+   http://www.perl.com/doc/manual/html/pod/perlre.html
+You should at least be aware that the characters "\\.?*+|^\$()[]{}" have
+special meaning in a regular expression and that they are unlike characters
+used for matching on a Windows command line.
+EOF
 	   }
        },
      },
@@ -5559,7 +5123,6 @@ tes3cmd header --synchronize "my plugin.esp"
      -lint =>
      { description => qq{Scan plugins and report possible problems},
        options => [@STDOPT,
-		   'active',
 		   'all'		    => \$opt_lint_all,
 		   'autocalc-spells'	    => \$opt_lint_autocalc_spells,
 		   'bloodmoon-dependency'   => \$opt_lint_bloodmoon_dependency,
@@ -5641,17 +5204,12 @@ tes3cmd header --synchronize "my plugin.esp"
        usage => qq{Usage: tes3cmd lint OPTIONS plugin...
 
 OPTIONS:
- --active
-	only process specified plugins that are active. If none specified,
-	process all active plugins. Plugins will be processed in the same
-	order as your normal game load order.
-
  --all/recommended
 	Enable all or recommended output options. When --recommended is
 	selected only the following options are enabled:
 	--bloodmoon-dependency, --clean, --deprecated-lists,
-	--duplicate-records, --evil-gmsts, --fog-sync, --fogbug,
-	--junk-cells, --modified-info-id, --expansion-dependency
+	--duplicate-records, --evil-gmsts, fog-sync, --fogbug, --junk-cells,
+	--modified-info-id, --expansion-dependency
 
  --autocalc-spells
 	The plugin defines autocalc'ed spells.
@@ -5843,45 +5401,54 @@ more detail about the flagged items.
       description => qq{Powerful batch record modification via user code extensions},
       options => [@STDOPT,
 		  @MODOPT,
-		  'active',
 		  'exact-id=s@',
 		  'exterior',
 		  'flag=s@',
 		  'id=s@',
 		  'ignore-plugin=s@',
 		  'interior',
-		  'match=s@',
-		  'no-match|M=s@',
+		  'match=s',
+		  'no-match|M=s',
 		  'program-file=s'     => \$opt_modify_program_file,
 		  'replace=s'          => \$opt_modify_replace,
-		  'replacefirst=s'     => \$opt_modify_replacefirst,
 		  'run=s'              => \$opt_modify_run,
 		  'sub-match=s',
-		  'sub-no-match=s',
+		  'sub-no-match|M=s',
 		  'type=s@'],
 
       preprocess => sub {
 	  # load Perl program if specified with --program-file
-	  load_perl($opt_modify_program_file);
-	  $opt_modify_run = 'main($R);' unless ($opt_modify_run);
-      },
+	  if ($opt_modify_program_file) {
+	      dbg("loading program-file: $opt_modify_program_file") if (DBG);
+	      # JMS - "do" seems to behave differently under Windows now, so this code is busted
+	      #	unless (do $opt_modify_program_file) {	# load perl file
+	      #	    abort("Error processing $opt_modify_program_file ($@)") if ($@);
+	      #	}
+	      my $prog;
+	      if (open(PROG, "<", $opt_modify_program_file)) {
+		  local $/ = undef;
+		  $prog = join("", <PROG>);
+		  close(PROG);
+	      } else {
+		  abort(qq{Error opening "$opt_modify_program_file" ($!)});
+	      }
+	      eval($prog);
+	      abort("Error processing $opt_modify_program_file ($@)") if ($@);
+	      $opt_modify_run = 'main($R);' unless ($opt_modify_run);
+	  }
+	  },
 
-      process => \&cmd_modify,
+	  process => \&cmd_modify,
 
-      usage => qq{Usage: tes3cmd modify OPTIONS plugin...
+	  usage => qq{Usage: tes3cmd modify OPTIONS plugin...
 
 OPTIONS:
  --debug
 	turn on debug messages
 
- --active
-	only process specified plugins that are active. If none specified,
-	process all active plugins. Plugins will be processed in the same
-	order as your normal game load order.
-
  --backup-dir
 	where backup files get stored. The default is:
-	"morrowind/tes3cmd/backups"
+	"Data Files/tes3cmd/backups"
 
  --exact-id* <id-string>
 	only modify records whose ids exactly match given <id-string>
@@ -5909,16 +5476,12 @@ OPTIONS:
  --interior
 	only match if record is an Interior CELL
 
- --match* <regex>
+ --match <regex>
 	only modify records that match given regular expression <regex>
-	If more than one of these switches is supplied, ALL must match
-	for a record to be processed.
 
- --no-match*|--M* <regex>
+ --no-match <regex>
 	only modify records that do not match given regular expression
 	<regex>
-	If more than one of these switches is supplied, if ANY match,
-	that record will be skipped.
 
  --program-file <file>
 	load Perl code to run on each matched record from file named: <file>
@@ -5929,9 +5492,6 @@ OPTIONS:
 	the slash as long as it does not occur in "a" or "b". This is a very
 	powerful alternative to the --run option, as it only requires
 	understanding of regular expressions, no perl coding is necessary.
-
- --replacefirst "/a/b/"
-	just like --replace, but only replaces the first match.
 
  --run "<code>"
 	specify a string of Perl <code> to run on each matched record
@@ -5955,7 +5515,7 @@ This command allows you to do complex batch modifications of plugin records.
 You can really damage things with this command, so be careful!
 
 Note: documentation for regular expressions:
-  http://perldoc.perl.org/perlre.html
+  http://www.perl.com/doc/manual/html/pod/perlre.html
 
 Example(s):
 
@@ -5983,141 +5543,24 @@ tes3cmd modify --type cont --run "\$R->dump" ale_clothing_v0.esp
 # Then only modify the last 3 items:
 tes3cmd modify --type cont --run "\$R->set({i=>[-3..-1],f=>'count'}, 4)" ale_clothing_v0.esp
 },
-     },
-
-     "-run" =>
-     {
-      description => qq{Run user code extensions},
-      options => [@STDOPT,
-		  @MODOPT,
-		  'active',
-		  'exact-id=s@',
-		  'exterior',
-		  'flag=s@',
-		  'id=s@',
-		  'ignore-plugin=s@',
-		  'interior',
-		  'match=s@',
-		  'no-match|M=s@',
-		  'program-file=s'     => \$opt_modify_program_file,
-		  'sub-match=s',
-		  'sub-no-match=s',
-		  'type=s@'],
-
-      preprocess => sub {
-	  # load Perl program if specified with --program-file
-	  load_perl($opt_run_program_file);
-      },
-
-      process => \&cmd_run,
-
-      usage => qq{Usage: tes3cmd run programfile OPTIONS plugin...
-
-Loads a tes3cmd extension "programfile" to perform custome processing of plugins.
-
-OPTIONS:
- --debug
-	turn on debug messages
-
- --active
-	only process specified plugins that are active. If none specified,
-	process all active plugins. Plugins will be processed in the same
-	order as your normal game load order.
-
- --backup-dir
-	where backup files get stored. The default is:
-	"morrowind/tes3cmd/backups"
-
- --exact-id* <id-string>
-	only modify records whose ids exactly match given <id-string>
-
- --exterior
-	only match if record is an Exterior CELL
-
- --flag* <flag>
-	only modify records with given flag. Flags may be given symbolically
-	as: (deleted, persistent, ignored, blocked), or via their numeric
-	values (i.e. persistent is 0x400).
-
- --hide-backups
-	any created backup files will get stashed in the backup directory
-	(--backup-dir)
-
- --id* <id-regex>
-	only modify records whose ids match regular expression pattern
-	<id-regex>
-
- --ignore-plugin* <plugin-name>
-        skips specified plugin if it appears on command line. plugin name is
-        matched by exact, but caseless, string comparison.
-
- --interior
-	only match if record is an Interior CELL
-
- --match* <regex>
-	only modify records that match given regular expression <regex>
-	If more than one of these switches is supplied, ALL must match
-	for a record to be processed.
-
- --no-match*|--M* <regex>
-	only modify records that do not match given regular expression
-	<regex>
-	If more than one of these switches is supplied, if ANY match,
-	that record will be skipped.
-
- --sub-match <regex>
-	only modify the subrecords that match <regex>. When this option (or
-	--sub-no-match) are used, modification only applies to matching
-	subrecords. Without either of these options modifications are
-	performed on whole records.
-
- --sub-no-match <regex> only modify the subrecords that do not match <regex>.
-	(see also --sub-match above).
-
- --type* <record-type>
-	only modify records with the given <record-type>
-
- Note: starred (*) options can be repeated, and matching of strings is not
- case-sensitive.
-
-This command allows you to do complex batch modifications of plugin records.
-You can really damage things with this command, so be careful!
-
-Note: documentation for regular expressions:
-  http://perldoc.perl.org/perlre.html
-
-Example(s):
-
-# Run your homegrown extension
-tes3cmd run myprog.pl ...
-
-},
-     },
+	 },
 
      multipatch =>
      { description => qq{Patches problems, merges leveled lists, etc.},
        options => [@STDOPT,
 		   'cellnames'       => \$opt_multipatch_cellnames,
-		   'delete-creature|dc=s@' => \@opt_multipatch_delete_creature,
-		   'delete-item|di=s@'     => \@opt_multipatch_delete_item,
 		   'fogbug'          => \$opt_multipatch_fogbug,
 		   'merge-lists'     => \$opt_multipatch_merge_lists,
-		   'merge-objects'   => \$opt_multipatch_merge_objects,
 		   'no-activate'     => \$opt_multipatch_no_activate,
 		   'no-cache',
 		   'summons-persist' => \$opt_multipatch_summons_persist],
 
        preprocess => sub {
 	   unless ($opt_multipatch_cellnames or $opt_multipatch_fogbug or
-		   $opt_multipatch_merge_lists or $opt_multipatch_summons_persist or
-		   $opt_multipatch_merge_objects) {
+		   $opt_multipatch_merge_lists or $opt_multipatch_summons_persist) {
 	       # by default turn on all options if none are selected
-	       $opt_multipatch_cellnames = $opt_multipatch_fogbug =
-		   $opt_multipatch_merge_lists = $opt_multipatch_merge_objects =
-		   $opt_multipatch_summons_persist = 1;
+	       $opt_multipatch_cellnames = $opt_multipatch_fogbug = $opt_multipatch_merge_lists = $opt_multipatch_summons_persist = 1;
 	   }
-	   %LEVC::user_delete_creature = map { lc, 1 } @opt_multipatch_delete_creature;
-	   %LEVI::user_delete_item = map { lc, 1 } @opt_multipatch_delete_item;
 	   cmd_multipatch();
        },
        usage => qq{Usage: tes3cmd multipatch
@@ -6135,19 +5578,7 @@ OPTIONS:
  --merge-lists
 	merges leveled lists used in your active plugins. Note that when you
 	use this feature, you do NOT also need other merged lists plugins like
-	"Mashed Lists.esp" from Wrye Mash.
-
-	This option has the following sub-options which can be used to remove
-	creatures and items (by exact id match) from all leveled lists in
-	which they occur:
-
-	--delete-creature*|--dc* <creature-id>
-	--delete-item*|--di* <item-id>
-
- --merge-objects
-	merges leveled lists used in your active plugins. Note that when you
-	use this feature, you do NOT also need other merged object plugins like
-	"Merged_Objects.esp" from TesTool. (NOT IMPLEMENTED YET).
+	"Mashed Lists.esp"
 
  --no-activate
 	do not automatically activate multipatch.esp
@@ -6167,7 +5598,7 @@ be safe to use it with no options to get the default patching behavior (if you
 do find any problems, please report them and they will be fixed ASAP). When no
 options are specified, the following default options are assumed:
 
-  --cellnames --fogbug --merge-lists --merge-objects --summons-persist
+  --cellnames --fogbug --merge-lists --summons-persist
 
 The different patching operations are explained below:
 
@@ -6200,13 +5631,7 @@ Fog Bug Patch (--fogbug)
 Merge Leveled Lists (--merge-lists)
 
   This feature is similar to what you get with Wrye Mash's "Mashed Lists.esp".
-  However, you should not use more than one plugin to merge leveled lists.
-
-Merge Objects (--merge-objects)
-
-  This feature is similar to what you get with TesTools's "Merged_Objects.esp".
-  However, you should not use more than one plugin to merge objects.
-  (NOT IMPLEMENTED YET)
+  However, you should not more than one plugin to merge leveled lists.
 
 Summoned creatures persists (--summons-persist)
 
@@ -6215,8 +5640,7 @@ Summoned creatures persists (--summons-persist)
   summoned creatures as persistent. The Morrowind Patch Project implements
   this fix, however other mods coming later in the load order often revert it.
   This option to the multipatch ensures that known summoned creatures are
-  flagged as persistent. The Morrowind Code Patch also fixes this bug, making
-  this feature redundant.
+  flagged as persistent.
 
 EXAMPLES:
 
@@ -6228,7 +5652,6 @@ tes3cmd multipatch
      overdial =>
      { description => qq{Identify overlapping dialog (a source of missing topic bugs)},
        options => [@STDOPT,
-		   'active',
 		   'ignore-plugin=s@',
 		   'single' => \$opt_overdial_single],
        preprocess => \&cmd_overdial,
@@ -6237,11 +5660,6 @@ tes3cmd multipatch
 OPTIONS:
  --debug
 	turn on debug messages
-
- --active
-	only process specified plugins that are active. If none specified,
-	process all active plugins. Plugins will be processed in the same
-	order as your normal game load order.
 
  --ignore-plugin* <plugin-name>
         skips specified plugin if it appears on command line. plugin name is
@@ -6287,7 +5705,7 @@ OPTIONS:
 
  --backup-dir
 	where backup files get stored. The default is:
-	"morrowind/tes3cmd/backups"
+	"Data Files/tes3cmd/backups"
 
  --hide-backups
 	any created backup files will get stashed in the backup directory
@@ -6344,43 +5762,6 @@ tes3cmd resetdates
 },
      },
 
-     -stats =>
-     { description => qq{Print out statistics on specified plugin(s)},
-       options => [@STDOPT,
-		   'active',
-		  ],
-       process => sub {
-	   my($plugin) = @_;
-	   dbg("cmd_stats($plugin)") if (DBG);
-	   my $fun = sub {
-	       my($rec_match, $rectype, $tr, $print_rec) = rec_match($plugin, @_); # calls tr->decode
-	       return unless ($rec_match);
-	       $STATS{$plugin}->{nrecords}++;
-	       $STATS{$plugin}->{nrectype}->{$rectype}++;
-	       foreach my $subtype (keys %{$tr->{SH}}) {
-		   $STATS{$plugin}->{listtype}->{qq{${rectype}.${subtype}}}++
-		       if (scalar(@{$tr->{SH}->{$subtype}} > 1));
-	       }
-	   };
-	   process_plugin_for_input($plugin, $fun) or return(0);
-       },
-       postprocess => sub {
-	   my $nplugins = scalar(keys %STATS);
-	   print qq{Number of plugins: $nplugins\n};
-	   my %listtype;
-	   foreach my $plugin (keys %STATS) {
-	       foreach my $type (sort keys %{$STATS{$plugin}->{listtype}}) {
-		   $listtype{$type} += $STATS{$plugin}->{listtype}->{$type};
-	       }
-	   }
-	   print qq{List-type Subrecords:\n};
-	   foreach my $type (sort keys %listtype) {
-	       print qq{$type\t$listtype{$type}\n};
-	   }
-       },
-       usage => qq{Usage: tes3cmd stats OPTIONS plugin...\n},
-     },
-
      '-undelete' =>
      { description => qq{Modifies plugins to undelete object instances (references)},
        options => [@STDOPT],
@@ -6390,11 +5771,6 @@ tes3cmd resetdates
 OPTIONS:
  --debug
 	turn on debug messages
-
- --active
-	only process specified plugins that are active. If none specified,
-	process all active plugins. Plugins will be processed in the same
-	order as your normal game load order.
 
  --verbose
 	print items that are undeleted from each cell.
@@ -6432,18 +5808,18 @@ Example:
 
 # Run a shell, and create a new blank ESP file:
 % tes3cmd -shell
-> open(\$F,">blank.esp") && print \$F make_header({ author => 'me', description => '' });
+> open(F,">blank.esp") && print F make_header({ author => 'john.moonsugar\@gmail.com', description => '' }) && close(F);
 
 ==> 1
-[type Ctrl-D to quit shell]\n},
+\n},
      },
 
      '-testcodec' =>
      { description => qq{Test TES3 codec orthogonality},
        options => [@STDOPT,
-		   'continue'             => \$opt_testcodec_continue,
+		   'continue|c'            => \$opt_testcodec_continue,
 		   'exclude-type|x=s@'    => \@opt_testcodec_exclude_type,
-		   'ignore-cruft'         => \$opt_testcodec_ignore_cruft],
+		   'ignore-cruft'          => \$opt_testcodec_ignore_cruft],
        process => \&cmd_testcodec,
        usage => qq{Usage: tes3cmd -testcodec [--exclude-type|-x exclude_type]\n},
      },
@@ -6451,25 +5827,7 @@ Example:
      '-wikiout' =>
      { description => qq{Output wiki formatted help},
        options => [@STDOPT],
-       preprocess => sub {
-	   dbg("cmd_wikiout") if (DBG);
-	   my $usage = 
-	       join("",
-		    $Usage1,
-		    (map { (/^(help|-)/ or (not defined $COMMAND{$_}->{description})) ? "" :
-			       "  $_\n    $COMMAND{$_}->{description}.\n" } (sort keys %COMMAND)),
-		    $Usage2);
-	   $usage =~ s/^/    /gm;	# blockquote the body of help
-	   print "# $usage\n";
-	   foreach my $cmd (sort keys %COMMAND) {
-	       next if (($cmd eq 'help') or ($cmd =~ /^-/));
-	       my $cmdusage = $COMMAND{$cmd}->{usage};
-	       my $desc = $COMMAND{$cmd}->{description};
-	       $cmdusage =~ s/^/    /gm;	# blockquote the body of help
-	       print "## $cmd - _${desc}\n\n$cmdusage\n";
-	   }
-	   print "(this page was automatically generated by: tes3cmd -wikiout)\n"
-       },
+       preprocess => \&cmd_wikiout,
        usage => qq{Usage: tes3cmd -wikiout\n},
      },
     );				# end of COMMAND DISPATCH TABLE
@@ -6765,14 +6123,6 @@ sub open_for_output {
     return($fh);
 }
 
-sub open_for_append {
-    my($plugin) = @_;
-    my $fh = IO::Handle->new;
-    open($fh, ">>", $plugin) or abort(qq{opening "$plugin" for append ($!)});
-    binmode($fh, ':raw') or abort(qq{setting binmode on "$plugin" ($!)});
-    return($fh);
-}
-
 sub open_for_update {
     my($plugin) = @_;
     my $fh = IO::Handle->new;
@@ -6913,6 +6263,9 @@ sub read_dialogs {
 	    next if ($tr->hdrflags & $HDR_FLAGS{ignored});
 	    next if ($tr->rectype ne "DIAL");
 	    my $id = $tr->decode()->id;
+
+		$id =~ s/\*/\\\*/g; # try to fix things breaking regex /abot
+
 	    my $type = $tr->get('DATA', 'type');
 	    $dialref->{$plugin}->{$id}++ if ($type == 0 and $id);
 	}
@@ -6923,7 +6276,7 @@ sub read_dialogs {
 
 sub master_cache_path {
     my($esm) = @_;
-    my $cname = "$CACHE_DIR/${esm}.cache";
+    my $cname = "$TES3CMD_DIR/${esm}.cache";
     dbg("master_cache_path($esm) -> $cname") if (DBG);
     return($cname);
 }
@@ -6998,106 +6351,28 @@ sub load_master {
     save_master_cache($esm);
 }
 
-sub load_mergeable_objects {
-    my $cachedata = {};
-    my $mergeable_object_cache_file = "$CACHE_DIR/mergeable_object_data.cache";
-    # load cache
-    if ($opt_no_cache) {
-	unlink($mergeable_object_cache_file)
-	    if (-f $mergeable_object_cache_file);
-    } else {
-	if (-f $mergeable_object_cache_file) {
-	    eval { $cachedata = retrieve($mergeable_object_cache_file); };
-	    if ($@) {
-		msg("Invalid Mergeable Objects Cache, will rebuild");
-		$cachedata = {};
-	    }
-	} else {
-	    msg("Creating Mergeable Objects Cache");
-	}
-    }
-    # Invalidate entire cache when codec changes
-    if (defined($cachedata->{_codec_version_}) and $cachedata->{_codec_version_} ne $TES3::Record::CODEC_VERSION) {
-	err("Invalidating Mergeable Object Cache due to CODEC update.");
-	$cachedata = {_codec_version_ => $TES3::Record::CODEC_VERSION };
-    }
-    my @load_order = $T3->load_order;
-    my %active = map { lc($_), 1 } @load_order;
-    foreach my $plugin (@load_order) {
-	my $lc_plugin = lc($plugin);
-	# skip known merged objects plugins
-	next if ($lc_plugin eq "multipatch.esp");
-	if ($lc_plugin eq "merged_objects.esp") {
-	    msg(qq{WARNING! "Merged_Objects.esp" is not needed when using multipatch})
-		if ($opt_multipatch_merge_objects);
-	    next;
-	}
-	my $curr_size = -s $T3->datapath($plugin);
-	my $invalid = 0;
-	if (defined($cachedata->{$lc_plugin})) {
-	    # update plugins that have changed size
-	    unless ($curr_size == $cachedata->{$lc_plugin}->{_size_}) {
-		msg("Mergeable Objects Cache UPDATING: $plugin");
-		delete $cachedata->{$lc_plugin};
-		$invalid = 1;
-	    }
-	} else {
-	    # add plugins added to load order
-	    prn("Mergeable Objects Cache ADDING: $plugin") if (VERBOSE);
-	    $invalid = 1;
-	}
-	if ($invalid) {
-	    my $inp = open_for_input($T3->datapath($plugin));
-	    eval {
-		while (my $tr = TES3::Record->new_from_input($inp, undef, $plugin)) {
-		    next unless ($TYPE_INFO{$tr->rectype}->{canmerge});
-		    next if ($tr->hdrflags & $HDR_FLAGS{ignored});
-		    $tr->decode;
-		    $cachedata->{$lc_plugin}->{$tr->rectype}->{$tr->id} = $tr;
-		}
-	    };
-	    close_input($inp);
-	    if ($@) {
-		err($@);
-		delete $cachedata->{$lc_plugin};
-	    } else {
-		$cachedata->{$lc_plugin}->{_size_} = $curr_size;
-	    }
-	}
-    }
-    # delete plugins no longer in load order
-    foreach my $plugin (keys %$cachedata) {
-	delete $cachedata->{$plugin} unless ($active{$plugin});
-    }
-    # save cache
-    unless ($opt_no_cache) {
-	store($cachedata, $mergeable_object_cache_file);
-    }
-    return($cachedata);
-} # load_mergeable_objects
-
 sub load_leveled_lists {
-    my $cachedata = {};
-    my $leveled_list_cache_file = "$CACHE_DIR/leveled_lists_data.cache";
+    my $levdat = {};
+    my $leveled_list_cache_file = "$TES3CMD_DIR/leveled_lists_data.cache";
     # load cache
     if ($opt_no_cache) {
 	unlink($leveled_list_cache_file)
 	    if (-f $leveled_list_cache_file);
     } else {
 	if (-f $leveled_list_cache_file) {
-	    eval { $cachedata = retrieve($leveled_list_cache_file); };
+	    eval { $levdat = retrieve($leveled_list_cache_file); };
 	    if ($@) {
 		msg("Invalid Leveled Lists Cache, will rebuild");
-		$cachedata = {};
+		$levdat = {};
 	    }
 	} else {
 	    msg("Creating Leveled Lists Cache");
 	}
     }
     # Invalidate entire cache when codec changes
-    if (defined($cachedata->{_codec_version_}) and $cachedata->{_codec_version_} ne $TES3::Record::CODEC_VERSION) {
+    if (defined($levdat->{_codec_version_}) and $levdat->{_codec_version_} ne $TES3::Record::CODEC_VERSION) {
 	err("Invalidating Leveled List Cache due to CODEC update.");
-	$cachedata = {_codec_version_ => $TES3::Record::CODEC_VERSION };
+	$levdat = {_codec_version_ => $TES3::Record::CODEC_VERSION };
     }
     my @load_order = $T3->load_order;
     my %active = map { lc($_), 1 } @load_order;
@@ -7117,11 +6392,11 @@ sub load_leveled_lists {
 	}
 	my $curr_size = -s $T3->datapath($plugin);
 	my $invalid = 0;
-	if (defined($cachedata->{$lc_plugin})) {
+	if (defined($levdat->{$lc_plugin})) {
 	    # update plugins that have changed size
-	    unless ($curr_size == $cachedata->{$lc_plugin}->{_size_}) {
+	    unless ($curr_size == $levdat->{$lc_plugin}->{_size_}) {
 		msg("Leveled List Cache UPDATING: $plugin");
-		delete $cachedata->{$lc_plugin};
+		delete $levdat->{$lc_plugin};
 		$invalid = 1;
 	    }
 	} else {
@@ -7136,27 +6411,27 @@ sub load_leveled_lists {
 		    next unless ($tr->rectype =~ /^LEV[CI]$/);
 		    next if ($tr->hdrflags & $HDR_FLAGS{ignored});
 		    $tr->decode;
-		    $cachedata->{$lc_plugin}->{$tr->rectype}->{$tr->id} = $tr;
+		    $levdat->{$lc_plugin}->{$tr->rectype}->{$tr->id} = $tr;
 		}
 	    };
 	    close_input($inp);
 	    if ($@) {
 		err($@);
-		delete $cachedata->{$lc_plugin};
+		delete $levdat->{$lc_plugin};
 	    } else {
-		$cachedata->{$lc_plugin}->{_size_} = $curr_size;
+		$levdat->{$lc_plugin}->{_size_} = $curr_size;
 	    }
 	}
     }
     # delete plugins no longer in load order
-    foreach my $plugin (keys %$cachedata) {
-	delete $cachedata->{$plugin} unless ($active{$plugin});
+    foreach my $plugin (keys %$levdat) {
+	delete $levdat->{$plugin} unless ($active{$plugin});
     }
     # save cache
     unless ($opt_no_cache) {
-	store($cachedata, $leveled_list_cache_file);
+	store($levdat, $leveled_list_cache_file);
     }
-    return($cachedata);
+    return($levdat);
 } # load_leveled_lists
 
 ### MAIN UTILITIES
@@ -7289,14 +6564,14 @@ sub update_header {
 	    if (not($opt_header_author or $opt_header_description or $opt_header_update_record_count or
 		    $opt_header_update_masters or $opt_header_update_record_count) or
 		$opt_header_author or $opt_header_description) {
+		my $auth = $hedr_tsr->{author};
+		$auth =~ s!\000+$!!;
+		my $desc = $hedr_tsr->{description};
+		$desc =~ s!\000+$!!;
 		if ($opt_header_multiline) {
-		    print qq{$plugin:\n}, $hedr_tsr->tostr, "\n";
+		    print qq{$plugin:\n  AUTH=$auth\n  DESC=$desc\n};
 		} else {
-		    my $auth = $hedr_tsr->{author};
-		    $auth =~ s!\000.*$!!;
-		    my $desc = $hedr_tsr->{description};
-		    $desc =~ s!\000.*$!!;
-		    my $msg = qq{$plugin: AUTH="$auth"  DESC="$desc"};
+		    my $msg = qq{$plugin: AUTH=$auth  DESC=$desc};
 		    $msg =~ s/(\r)?\n/\\r\\n/gm;
 		    print "$msg\n";
 		}
@@ -7326,19 +6601,20 @@ sub update_header {
     utime($atime, $mtime, $plugin);
 }				# update_header
 
+# TBD - should get_wanted be moved to pre-process?
 sub get_wanted {
-    # set up global wanted record selectors
-    $WANTED_IDS = $WANTED_FLAGS = $WANTED_TYPES = undef;
     my @wanted_ids = @opt_id;
     push(@wanted_ids, map { '^'.quotemeta($_).'$' } @opt_exact_id) if (@opt_exact_id);
-    $WANTED_IDS = (@wanted_ids) ? '(' . join('|', @wanted_ids) . ')' : '';
+    my $wanted_ids = (@wanted_ids) ? '(' . join('|', @wanted_ids) . ')' : '';
+    my $wanted_flags;
     foreach my $flag (@opt_flag) {
 	if ($flag =~ /^(?:0[xob])?\d+$/) {
-	    $WANTED_FLAGS |= (eval $flag); # it's a numeric flag
+	    $wanted_flags |= (eval $flag); # it's a numeric flag
 	} else {
-	    $WANTED_FLAGS |= $HDR_FLAGS{lc($flag)};
+	    $wanted_flags |= $HDR_FLAGS{lc($flag)};
 	}
     }
+	my $wanted_types;
     if ($opt_instance_match or $opt_instance_no_match or $opt_exterior or $opt_interior) {
 	# assume type == CELL if user selects object instance matching or interior/exterior
 	if (@opt_type and (uc("@opt_type") ne "CELL")) {
@@ -7354,33 +6630,30 @@ sub get_wanted {
     if (@opt_type) {
 	foreach my $option (@opt_type) {
 	    my($wrectype, $wsubtype) = split(/\./, uc($option));
-	    if ($wrectype eq 'NPC') {
-		msg('[Using "NPC" as shorthand for "NPC_" record type.]');
-		$wrectype = 'NPC_';
-	    }
 	    if (length($wrectype) != 4) {
 		abort(qq{get_wanted_types: Invalid record type: "$wrectype" (must be 4 characters long)});
 	    }
-	    $WANTED_TYPES->{$wrectype}++;
+	    $wanted_types->{$wrectype}++;
 	    if ($wsubtype) {
 		if (length($wsubtype) == 4) {
-		    $WANTED_TYPES->{"$wrectype.$wsubtype"}++;
+		    $wanted_types->{"$wrectype.$wsubtype"}++;
 		} else {
 		    abort(qq{get_wanted_types: Invalid record subtype: "$wsubtype" (must be 4 characters long)});
 		}
 	    }
 	}
     }
+	return($wanted_ids, $wanted_types, $wanted_flags);
 }
 
 # return 1 if record matches selection criteria of command line switches
 sub rec_match {
-    my($plugin, $rectype, $tr) = @_;
+    my($plugin, $rectype, $tr, $wanted_ids, $wanted_types, $wanted_flags) = @_;
     $tr->decode if ($rectype eq 'DIAL');
-    return(0, $rectype, $tr) if ($WANTED_FLAGS and not ($tr->hdrflags & $WANTED_FLAGS));
-    return(0, $rectype, $tr) if ($WANTED_TYPES and not $WANTED_TYPES->{$rectype});
+    return(0, $rectype, $tr) if ($wanted_flags and not ($tr->hdrflags & $wanted_flags));
+    return(0, $rectype, $tr) if ($wanted_types and not $wanted_types->{$rectype});
     $tr->decode unless ($rectype eq 'DIAL');
-    return(0, $rectype, $tr) if ($WANTED_IDS and not ($tr->id =~ /$WANTED_IDS/i));
+    return(0, $rectype, $tr) if ($wanted_ids and not ($tr->id =~ /$wanted_ids/i));
     if ($rectype eq 'CELL') {
 	if ($tr->is_interior()) {
 	    return(0, $rectype, $tr) if ($opt_exterior);
@@ -7388,19 +6661,14 @@ sub rec_match {
 	    return(0, $rectype, $tr) if ($opt_interior);
 	}
     }
-    if (@opt_match or @opt_no_match) {
+    if ($opt_match or $opt_no_match) {
 	my $print_rec = $tr->tostr;
-	# record must not match ANY pattern in --no-match
-	foreach my $no_match (@opt_no_match) {
-	    return(0, $rectype, $tr, $print_rec)
-		if ($print_rec =~ /$no_match/is);
+    if (((not $opt_match) or ($print_rec =~ /$opt_match/is)) and
+	    ((not $opt_no_match) or ($print_rec !~ /$opt_no_match/is))) {
+	    return(1, $rectype, $tr, $print_rec);
+	} else {
+	    return(0, $rectype, $tr, $print_rec);
 	}
-	# record must not match ALL patterns in --match
-	foreach my $match (@opt_match) {
-	    return(0, $rectype, $tr, $print_rec)
-		if ($print_rec !~ /$match/is);
-	}
-	return(1, $rectype, $tr, $print_rec);
     } else {
 	return(1, $rectype, $tr);
     }
@@ -7433,8 +6701,12 @@ sub buffalize {
     my(@this_group) = @_;
     my($objidx, $recbuf, $objname);
     my $frmr_tsr = shift(@this_group);
-    # TBD (per abot) we check for MVRF here too, but we need to handle MVRFs better
-    if (($frmr_tsr->subtype eq 'FRMR') or (($frmr_tsr->subtype eq 'MVRF'))) {
+#abot --- begin
+    #if ($frmr_tsr->subtype eq 'FRMR') {
+#abot --- end
+#abot +++ begin
+    if ( ($frmr_tsr->subtype eq 'FRMR') or ($frmr_tsr->subtype eq 'MVRF') ) {
+#abot +++ end
 	$objidx = $frmr_tsr->{objidx};
     } else {
 	abort("Oops! Expected first subrec of group to be FRMR, instead got: ".$frmr_tsr->subtype);
@@ -7450,13 +6722,14 @@ sub buffalize {
 sub process_plugin_for_input {
     my($plugin, $fun) = @_;
     my $expected = "TES3";
+	my($wanted_ids, $wanted_types, $wanted_flags) = get_wanted();
     # TBD - to support using instance types, will need to load masters
     # process each record in the plugin
     eval {
 	my $inp = open_for_input($plugin);
 	while (my $tr = TES3::Record->new_from_input($inp, $expected, $plugin)) {
 	    $expected = undef;
-	    $fun->($tr->{_rectype_}, $tr);
+	    $fun->($tr->rectype, $tr, $wanted_ids, $wanted_types, $wanted_flags);
 	}
 	close_input($inp);
     };
@@ -7475,6 +6748,7 @@ sub process_plugin_for_input {
 sub process_plugin_for_update {
     my($plugin, $fun, $prefix) = @_;
     my $expected = "TES3";
+	my($wanted_ids, $wanted_types, $wanted_flags) = get_wanted();
     my $modified;
     my($inp, $out);
     # TBD - to support using instance types, will need to load masters
@@ -7484,7 +6758,7 @@ sub process_plugin_for_update {
 	while (my $tr = TES3::Record->new_from_input($inp, $expected, $plugin)) {
 	    $expected = undef;
 	    # function can delete, modify, or pass rec thru
-	    my $trnew = $fun->($tr->rectype, $tr);
+	    my $trnew = $fun->($tr->rectype, $tr, $wanted_ids, $wanted_types, $wanted_flags);
 	    if (defined $trnew) { # rec was kept
 		if ($trnew) {	   # rec was changed
 		    $trnew->write_rec($out);
@@ -7625,8 +6899,8 @@ sub cmd_lint {
     };
     process_plugin_for_input($plugin, $fun) or return(0);
     my $found = "";
-    $found .= " AUTOSPL" if (@autospl);
-    $found .= " CELL00"  if ($cell00);
+    # $found .= " AUTOSPL" if (@autospl);
+    # $found .= " CELL00"  if ($cell00);
     # $found .= " BM-DEP"  if ((not $mastbm) and %bmfun);
     # $found .= " DEP-LST" if (%deplst);
     # $found .= " DUP-INF" if ($dup_inf);
@@ -7761,7 +7035,6 @@ sub cmd_testcodec {
 			dumpit('original', $oldsubrec);
 			dumpit('re-coded', $newsubrec);
 			#msg(Dumper($tsr));
-			msg($tr->tostr);
 			abort("Test Halted") unless ($opt_testcodec_continue);
 		    }
 		}
@@ -7799,15 +7072,15 @@ sub cmd_fixit {
     dbg("cmd_fixit") if (DBG);
     # reset dates on Bethesda data files
     cmd_resetdates();
-    # clean everything and overwrite originals and hide backups
-    $opt_hide_backups = $opt_overwrite = $opt_clean_instances = $opt_clean_cell_params =
+    # clean everything and overwrite originals
+    $opt_overwrite = $opt_clean_instances = $opt_clean_cell_params =
 	$opt_clean_dups = $opt_clean_gmsts = $opt_clean_junk_cells = 1;
     foreach my $plugin ($T3->load_order()) {
 	cmd_clean($CURRENT_PLUGIN = $plugin)
     }
     # generate all patches
     $opt_multipatch_cellnames = $opt_multipatch_fogbug = $opt_multipatch_merge_lists =
-	$opt_multipatch_merge_objects = $opt_multipatch_summons_persist = 1;
+    $opt_multipatch_summons_persist = 1;
     cmd_multipatch();
     # synchronize plugin headers to masters
     prn("\n\nSynchronizing Plugin Headers...");
@@ -7815,6 +7088,17 @@ sub cmd_fixit {
     foreach my $plugin ($T3->load_order()) {
 	cmd_header($CURRENT_PLUGIN = $plugin)
     }
+}
+
+sub cmd_wikiout {
+	dbg("cmd_wikiout") if (DBG);
+	foreach my $cmd (sort keys %COMMAND) {
+	next if (($cmd eq 'help') or ($cmd =~ /^-/));
+	my $usage = $COMMAND{$cmd}->{usage};
+	my $desc = $COMMAND{$cmd}->{description};
+	#$usage =~ s/'/''/g; # apparently no longer needed!
+	print "==$cmd - _${desc}_==\n{{{\n$usage\n}}}\n\n";
+	}
 }
 
 sub multipatch_check_fogbug {
@@ -7871,145 +7155,33 @@ sub multipatch_check_cell_rename_reversions {
     }
 } # multipatch_check_cell_rename_reversions
 
-#*** Object Merge Gotchas
-#**** autocalced vs. non-autocalced NPCs NPDT
-#**** deleted body parts from clothes (redefining the set of body parts for a CLOT) (grouped subrecs)
-#**** handle patch plugins that are *supposed* to only override the patchee (auto-detect?)
-sub multipatch_merge_objects {
-    return; #NOTYET
-    my @merged_objects = ();
-    my $cachedata = load_mergeable_objects();
-    my $mo = {};		# merge objects data
-    foreach my $plugin ($T3->load_order()) {
-	my $lc_plugin = lc($plugin);
-	if (defined($cachedata->{$lc_plugin})) {
-	    foreach my $rectype (keys %{$cachedata->{$lc_plugin}}) {
-		next unless ($TYPE_INFO{$rectype}->{canmerge}); # redundant with load_mergeable_objects but why not
-		foreach my $id (keys %{$cachedata->{$lc_plugin}->{$rectype}}) {
-		    my $tr = $cachedata->{$lc_plugin}->{$rectype}->{$id};
-		    push(@{$mo->{$rectype}->{$id}}, [$plugin, $tr]);
-		}
-	    }
-	}
-    }
-    foreach my $rectype (sort keys %{$mo}) {
-	foreach my $id (sort keys %{$mo->{$rectype}}) {
-	    if (scalar(@{$mo->{$rectype}->{$id}}) == 1) {
-		print " [MERGE_OBJECTS] skipping $rectype $id - defined only once in: [$mo->{$rectype}->{$id}->[0]->[0]]\n"
-		    if (VERBOSE);
-		next;
-	    }
-	    if (scalar(@{$mo->{$rectype}->{$id}}) == 2) {
-		print " [MERGE_OBJECTS] skipping $rectype $id - defined only twice, using: [$mo->{$rectype}->{$id}->[1]->[0]]\n"
-		    if (VERBOSE);
-		next;
-	    }
-	    my $first_tr = $mo->{$rectype}->{$id}->[0]->[1];
-	    my $last_tr = $mo->{$rectype}->{$id}->[-1]->[1];
-	    my $new_tr = $first_tr->copy;
-	    $new_tr->hdrflags($last_tr->hdrflags);
-	    foreach (@{$mo->{$rectype}->{$id}}) {
-		my($plugin, $tr) = @{$_};
-		my @group;    # a list of subrec groups that need to be merged
-		my $currentgroup; # current group type
-		foreach my $tsr ($tr->subrecs) {
-		    my $subtype = $tsr->subtype;
-		    if ($currentgroup and
-			(not defined $TYPE_INFO{$rectype}->{group}->{$subtype}->{member}->{$currentgroup})) {
-			# TBD also check for a new group start
-			# if current subtype is not a member of the current
-			# group we have finished collecting a group
-			if ($TYPE_INFO{$rectype}->{mergegroup}->{$currentgroup}) {
-			    # merge the group/list
-			} else {
-			    # replace the group/list
-			}
-			$currentgroup = undef;
-		    }
-		    if ($TYPE_INFO{$rectype}->{mergefields}->{$subtype}) {
-			my @fieldnames = $tsr->fieldnames;
-			if (scalar(@fieldnames) == 1) {
-			    # merge this subrecord as it only contains one field
-			    # and if it differs from the original definition
-			    my $fieldname = $fieldnames[0];
-			    my $val = $tr->get($subtype, $fieldname);
-			    # TBD: initialize a new subtype tsr if doesn't exist in new_tr?
-			    if ($first_tr->get($subtype, $fieldname) ne $val) {
-				$new_tr->set({ t=>$subtype, f=>$fieldname }, $val);
-			    }
-			} else {
-			}
-		    } elsif ($TYPE_INFO{$rectype}->{group}->{$subtype}) {
-			push(@group, $tsr);
-			$currentgroup = $subtype
-			    if ($TYPE_INFO{$rectype}->{group}->{$subtype}->{start});
-		    } else {
-			# by default merge whole subrec, last guy wins
-		    }
-		}
-		if ($currentgroup) {
-		    if ($TYPE_INFO{$rectype}->{mergegroup}->{$currentgroup}) {
-			# merge the group/list
-		    } else {
-			# replace the group/list
-		    }
-		}
-	    }
-	}
-    }
-    return(\@merged_objects);
-}				# multipatch_merge_objects
-
-sub multipatch_merge_leveled_lists_new {
-    my @merged_lists;
-    my $cachedata = load_leveled_lists();
+sub multipatch_merge_leveled_lists {
+    my @merged_lists = ();
+    my $levdat = load_leveled_lists();
     my $ll = {};
     foreach my $plugin ($T3->load_order()) {
 	my $lc_plugin = lc($plugin);
-	if (defined($cachedata->{$lc_plugin})) {
+    if (defined($levdat->{$lc_plugin})) {
 	    foreach my $rectype (qw(LEVC LEVI)) {
-		foreach my $id (keys %{$cachedata->{$lc_plugin}->{$rectype}}) {
-		    my $tr = $cachedata->{$lc_plugin}->{$rectype}->{$id};
+		foreach my $id (keys %{$levdat->{$lc_plugin}->{$rectype}}) {
+		    my $tr = $levdat->{$lc_plugin}->{$rectype}->{$id};
 		    push(@{$ll->{$rectype}->{$id}}, [$plugin, $tr]);
 		}
 	    }
 	}
     }
     foreach my $rectype (qw(LEVC LEVI)) {
-	my %user_deletions;
-	if ($rectype eq 'LEVC') {
-	    $user_deletions{$_}++ foreach (@opt_multipatch_delete_creature);
-	} elsif ($rectype eq 'LEVI') {
-	    $user_deletions{$_}++ foreach (@opt_multipatch_delete_item);
-	}
 	foreach my $id (sort keys %{$ll->{$rectype}}) {
 	    dbg(qq{examining $rectype: "$id"}) if (DBG);
 	    if (scalar(@{$ll->{$rectype}->{$id}}) == 1) {
-		print " [LEVLIST] skipping $rectype $id - defined only once in: [$ll->{$rectype}->{$id}->[0]->[0]]\n"
-		    if (VERBOSE);
+		print " [LEVLIST] skipping $rectype $id - defined only once: [$ll->{$rectype}->{$id}->[0]->[0]]\n" if (VERBOSE);
 		next;
 	    }
-	    if (scalar(@{$ll->{$rectype}->{$id}}) == 2) {
-		print " [LEVLIST] skipping $rectype $id - defined only twice, using: [$ll->{$rectype}->{$id}->[1]->[0]]\n"
-		    if (VERBOSE);
-		next;
-	    }
-	    my($first_plugin, $first_tr) = shift(@{$ll->{$rectype}->{$id}});
-	    my $merged_tr = $first_tr->merge($first_plugin, $ll->{$rectype}->{$id});
-
-	    my $last_tr = $ll->{$rectype}->{$id}->[-1]->[1];
-	    # strategy: last guy wins for List Flags
-	    my $last_list_flags = $last_tr->get('DATA', 'list_flags');
-	    # strategy: last guy wins for "Chance_None"
-	    my $last_chance = $last_tr->get('NNAM', 'chance_none');
 	    my %levlist;
-	    my $firstdef;
-	    # For each defined leveled list (LEVC/LEVI) from first to last in load order
-	    foreach (@{$ll->{$rectype}->{$id}}) {
-		my($plugin, $tr) = @{$_};
+	    foreach my $lref (@{$ll->{$rectype}->{$id}}) {
+		my($plugin, $tr) = @$lref;
 		my $element_id;
-		my $currdef;
-		# For each item in list per plugin
+		my %levtmp;
 		foreach my $tsr ($tr->subrecs()) {
 		    my $subtype = $tsr->subtype;
 		    if ($subtype eq 'CNAM') {
@@ -8018,215 +7190,38 @@ sub multipatch_merge_leveled_lists_new {
 			$element_id = $tsr->{item_id};
 		    } elsif ($subtype eq 'INTV') {
 			my $level = $tsr->{level};
-			# increment count of times this id appears at this level
-			$currdef->{$element_id}->{$level}++;
+			$levtmp{$element_id}->{$level}++;
 		    }
 		}
-		if ($firstdef) { # merge
-		    # Additions/Changes to list
-		    foreach my $element_id (keys %{$currdef}) {
-			foreach my $level (keys %{$currdef->{$element_id}}) {
-			    if ((not defined $firstdef->{$element_id}) or
-				(not defined $firstdef->{$element_id}->{$level}) or
-				($currdef->{$element_id}->{$level} != $firstdef->{$element_id}->{$level})) {
-				$levlist{$element_id}->{$level} = $currdef->{$element_id}->{$level};
-			    }
-			}
-		    }
-		    # Deletions from original definition
-		    foreach my $element_id (keys %{$firstdef}) {
-			if (not defined $currdef->{$element_id}) {
-			    delete $levlist{$element_id};
-			} else {
-			    foreach my $level (keys %{$firstdef->{$element_id}}) {
-				if (not defined $currdef->{$element_id}->{$level}) {
-				    delete $levlist{$element_id}->{$level};
-				}
-			    }
-			}
-		    }
-		} else {	# define initial leveled list
-		    $firstdef = $currdef;
-		    foreach my $element_id (keys %{$currdef}) {
-			foreach my $level (keys %{$currdef->{$element_id}}) {
-			    $levlist{$element_id}->{$level} = $currdef->{$element_id}->{$level};
-			}
-		    }
-		}
+		# replace old with the new
+		$levlist{$_} = $levtmp{$_} foreach (keys %levtmp);
 	    }
 	    print " [LEVLIST] Defining $rectype $id ->\n" if (VERBOSE);
 	    my @unsorted_list;
-	    my %deleted_items;
 	    foreach my $element_id (keys %levlist) {
 		foreach my $level (keys %{$levlist{$element_id}}) {
 		    my $count = $levlist{$element_id}->{$level};
 		    for (my $i=0; $i < $count; $i++) {
-			if ($user_deletions{$element_id}) { # from switches: --delete-creature|--delete-item
-			    $deleted_items{$element_id}++;
-			} else {
-			    push(@unsorted_list, [$level, $element_id]);
-			}
+			push(@unsorted_list, [$level, $element_id]);
 		    }
 		}
 	    }
 	    # sort the leveled list by level, then by crea/item id
 	    my @sorted_list;
-	    foreach (sort {$a->[0] <=> $b->[0] or $a->[1] cmp $b->[1]} @unsorted_list) {
-		my($level, $element_id) = @{$_};
+	    foreach my $lref (sort {$a->[0] <=> $b->[0] or $a->[1] cmp $b->[1]} @unsorted_list) {
+		my($level, $element_id) = @$lref;
 		print "\t[lev=$level cre=$element_id]\n" if (VERBOSE);
 		push(@sorted_list, [$element_id, $level]);
 	    }
-	    my @deleted_list = sort keys %deleted_items;
-	    if (VERBOSE and @deleted_list) {
-		print "\tDeleted IDs:\n";
-		print "\t  $_\n" foreach (@deleted_list);
-	    }
 	    my $indx = scalar(@sorted_list);
-	    my $newrec = [[NAME => { id => $id }],
-			  [DATA => { list_flags => $last_list_flags }],
-			  [NNAM => { chance_none => $last_chance }],
-			  [INDX => { item_count => $indx }]];
-	    my $tr;
-	    if ($rectype eq 'LEVC') {
-		$tr = LEVC->new($newrec);
-		foreach (@sorted_list) {
-		    my($element_id, $level) = @{$_};
-		    $tr->append(LEVC::CNAM->new({ creature_id => $element_id }),
-				LEVC::INTV->new({ level => $level }));
-		}
-	    } else {
-		$tr = LEVI->new($newrec);
-		foreach (@sorted_list) {
-		    my($element_id, $level) = @{$_};
-		    $tr->append(LEVI::INAM->new({ item_id => $element_id }),
-				LEVI::INTV->new({ level => $level }));
-		}
-	    }
-	    push(@merged_lists, $merged_tr);
-	}
-    }
-    return(\@merged_lists);
-}				# multipatch_merge_leveled_lists_new
 
-sub multipatch_merge_leveled_lists_old {
-    my @merged_lists;
-    my $cachedata = load_leveled_lists();
-    my $ll = {};
-    foreach my $plugin ($T3->load_order()) {
-	my $lc_plugin = lc($plugin);
-	if (defined($cachedata->{$lc_plugin})) {
-	    foreach my $rectype (qw(LEVC LEVI)) {
-		foreach my $id (keys %{$cachedata->{$lc_plugin}->{$rectype}}) {
-		    my $tr = $cachedata->{$lc_plugin}->{$rectype}->{$id};
-		    push(@{$ll->{$rectype}->{$id}}, [$plugin, $tr]);
-		}
-	    }
-	}
-    }
-    foreach my $rectype (qw(LEVC LEVI)) {
-	my %user_deletions;
-	if ($rectype eq 'LEVC') {
-	    $user_deletions{$_}++ foreach (@opt_multipatch_delete_creature);
-	} elsif ($rectype eq 'LEVI') {
-	    $user_deletions{$_}++ foreach (@opt_multipatch_delete_item);
-	}
-	foreach my $id (sort keys %{$ll->{$rectype}}) {
-	    dbg(qq{examining $rectype: "$id"}) if (DBG);
-	    if (scalar(@{$ll->{$rectype}->{$id}}) == 1) {
-		print " [LEVLIST] skipping $rectype $id - defined only once in: [$ll->{$rectype}->{$id}->[0]->[0]]\n"
-		    if (VERBOSE);
-		next;
-	    }
-	    if (scalar(@{$ll->{$rectype}->{$id}}) == 2) {
-		print " [LEVLIST] skipping $rectype $id - defined only twice, using: [$ll->{$rectype}->{$id}->[1]->[0]]\n"
-		    if (VERBOSE);
-		next;
-	    }
+		# moved things after sorting to fix problems with chance_none and perhaps list_flags too /abot
 	    my $last_tr = $ll->{$rectype}->{$id}->[-1]->[1];
 	    # strategy: last guy wins for List Flags
 	    my $last_list_flags = $last_tr->get('DATA', 'list_flags');
 	    # strategy: last guy wins for "Chance_None"
 	    my $last_chance = $last_tr->get('NNAM', 'chance_none');
-	    my %levlist;
-	    my $firstdef;
-	    # For each defined leveled list (LEVC/LEVI) from first to last in load order
-	    foreach (@{$ll->{$rectype}->{$id}}) {
-		my($plugin, $tr) = @{$_};
-		my $element_id;
-		my $currdef;
-		# For each item in list per plugin
-		foreach my $tsr ($tr->subrecs()) {
-		    my $subtype = $tsr->subtype;
-		    if ($subtype eq 'CNAM') {
-			$element_id = $tsr->{creature_id};
-		    } elsif ($subtype eq 'INAM') {
-			$element_id = $tsr->{item_id};
-		    } elsif ($subtype eq 'INTV') {
-			my $level = $tsr->{level};
-			# increment count of times this id appears at this level
-			$currdef->{$element_id}->{$level}++;
-		    }
-		}
-		if ($firstdef) { # merge
-		    # Additions/Changes to list
-		    foreach my $element_id (keys %{$currdef}) {
-			foreach my $level (keys %{$currdef->{$element_id}}) {
-			    if ((not defined $firstdef->{$element_id}) or
-				(not defined $firstdef->{$element_id}->{$level}) or
-				($currdef->{$element_id}->{$level} != $firstdef->{$element_id}->{$level})) {
-				$levlist{$element_id}->{$level} = $currdef->{$element_id}->{$level};
-			    }
-			}
-		    }
-		    # Deletions from original definition
-		    foreach my $element_id (keys %{$firstdef}) {
-			if (not defined $currdef->{$element_id}) {
-			    delete $levlist{$element_id};
-			} else {
-			    foreach my $level (keys %{$firstdef->{$element_id}}) {
-				if (not defined $currdef->{$element_id}->{$level}) {
-				    delete $levlist{$element_id}->{$level};
-				}
-			    }
-			}
-		    }
-		} else {	# define initial leveled list
-		    $firstdef = $currdef;
-		    foreach my $element_id (keys %{$currdef}) {
-			foreach my $level (keys %{$currdef->{$element_id}}) {
-			    $levlist{$element_id}->{$level} = $currdef->{$element_id}->{$level};
-			}
-		    }
-		}
-	    }
-	    print " [LEVLIST] Defining $rectype $id ->\n" if (VERBOSE);
-	    my @unsorted_list;
-	    my %deleted_items;
-	    foreach my $element_id (keys %levlist) {
-		foreach my $level (keys %{$levlist{$element_id}}) {
-		    my $count = $levlist{$element_id}->{$level};
-		    for (my $i=0; $i < $count; $i++) {
-			if ($user_deletions{$element_id}) { # from switches: --delete-creature|--delete-item
-			    $deleted_items{$element_id}++;
-			} else {
-			    push(@unsorted_list, [$level, $element_id]);
-			}
-		    }
-		}
-	    }
-	    # sort the leveled list by level, then by crea/item id
-	    my @sorted_list;
-	    foreach (sort {$a->[0] <=> $b->[0] or $a->[1] cmp $b->[1]} @unsorted_list) {
-		my($level, $element_id) = @{$_};
-		print "\t[lev=$level cre=$element_id]\n" if (VERBOSE);
-		push(@sorted_list, [$element_id, $level]);
-	    }
-	    my @deleted_list = sort keys %deleted_items;
-	    if (VERBOSE and @deleted_list) {
-		print "\tDeleted IDs:\n";
-		print "\t  $_\n" foreach (@deleted_list);
-	    }
-	    my $indx = scalar(@sorted_list);
+
 	    my $newrec = [[NAME => { id => $id }],
 			  [DATA => { list_flags => $last_list_flags }],
 			  [NNAM => { chance_none => $last_chance }],
@@ -8234,36 +7229,35 @@ sub multipatch_merge_leveled_lists_old {
 	    my $tr;
 	    if ($rectype eq 'LEVC') {
 		$tr = LEVC->new($newrec);
-		foreach (@sorted_list) {
-		    my($element_id, $level) = @{$_};
+		foreach my $lref (@sorted_list) {
+		    my($element_id, $level) = @$lref;
 		    $tr->append(LEVC::CNAM->new({ creature_id => $element_id }),
 				LEVC::INTV->new({ level => $level }));
 		}
 	    } else {
 		$tr = LEVI->new($newrec);
-		foreach (@sorted_list) {
-		    my($element_id, $level) = @{$_};
+		foreach my $lref (@sorted_list) {
+		    my($element_id, $level) = @$lref;
 		    $tr->append(LEVI::INAM->new({ item_id => $element_id }),
 				LEVI::INTV->new({ level => $level }));
 		}
 	    }
 	    push(@merged_lists, $tr);
 	}
-    }
-    return(\@merged_lists);
-}				# multipatch_merge_leveled_lists_old
+	}
+	return(\@merged_lists);
+} # multipatch_merge_leveled_lists
 
 sub cmd_multipatch {
-    dbg("cmd_multipatch") if (DBG);
-    print "\nMultipatch: Scanning Active Plugins...\n";
-    my $patch_file = "multipatch.esp";
-    my $patch_path = "$DATADIR/$patch_file";
-    my %fogcell;		# fogbugged cells
-    my %rencell;		# cells with reverted renamings
-    my %sumcrea;		# critters needing persistent flag
-    my $merged_objects = multipatch_merge_objects() if ($opt_multipatch_merge_objects);
-    my $merged_lists = multipatch_merge_leveled_lists_old() if ($opt_multipatch_merge_lists);
-    foreach my $plugin ($T3->load_order()) {
+	dbg("cmd_multipatch") if (DBG);
+	print "\nMultipatch: Scanning Active Plugins...\n";
+	my $patch_file = "multipatch.esp";
+	my $patch_path = "$DATADIR/$patch_file";
+	my %fogcell;		# fogbugged cells
+	my %rencell;		# cells with reverted renamings
+	my %sumcrea;		# critters needing persistent flag
+	my $merged_lists = multipatch_merge_leveled_lists() if ($opt_multipatch_merge_lists);
+	foreach my $plugin ($T3->load_order()) {
 	$CURRENT_PLUGIN = $plugin;
 	if (my $reason = $NOPATCH_PLUGIN{lc($plugin)}) {
 	    prn("tes3cmd multipatch skipping $plugin: ${reason}.");
@@ -8319,11 +7313,11 @@ sub cmd_multipatch {
     my $nfogbugs = scalar keys %fogcell;
     my $nrenrevs = scalar(grep {defined} map {$_->{OUTPUTFLAG}} values(%rencell));
     my $nsumcrea = scalar keys %sumcrea;
-    if ($nfogbugs or $nrenrevs or $nsumcrea or $merged_lists or $merged_objects) {
+    if ($nfogbugs or $nrenrevs or $nsumcrea or (scalar(@$merged_lists) > 0)) {
 	print "\n".("="x75)."\n";
 	print "A multipatch has been conjured for you to address the following issues:\n";
 	my $out = open_for_output($patch_path);
-	print $out make_header();
+    print $out make_header({description => "MultiPatch\n\nVersion: $::VERSION"});
 	if ($nrenrevs) {
 	    print "\nPreserving the following $nrenrevs CELL renamings:\n";
 	    foreach my $coord (keys %rencell) {
@@ -8358,16 +7352,6 @@ sub cmd_multipatch {
 		$tr->write_rec($out);
 	    }
 	}
-	if ($merged_objects) {
-	    my %count;
-	    my $total = 0;
-	    foreach my $tr (@$merged_lists) {
-		$count{$tr->rectype()}++;
-		$total++;
-		$tr->write_rec($out);
-	    }
-	    print "\nMerged Objects ($total)\n";
-	}
 	if ($merged_lists) {
 	    my %count;
 	    $count{LEVC} = $count{LEVI} = 0;
@@ -8384,8 +7368,7 @@ sub cmd_multipatch {
 	push(@options, 'merge_lists') if $opt_multipatch_merge_lists;
 	push(@options, 'summons_persist') if $opt_multipatch_summons_persist;
 	$opt_header_update_record_count = 1;
-	$opt_header_author = "tes3cmd multipatch";
-	$opt_header_description = "options: ".join(",", @options);
+	$opt_header_description = "+ \r\nOPT: ".join(",", @options);
 	update_header($patch_path, [qw(QUIET NOBACKUP)]);
 	undef $opt_header_description;
 	unless ($opt_multipatch_no_activate) {
@@ -8508,13 +7491,7 @@ sub cmd_diff {
 		my $print_rec2 = $tr2->tostr;
 		$print_rec2 =~ s/$ignore_subtypes_re}.*/$1 [IGNORED]/mg if (defined $ignore_subtypes_re);
 		$print_rec2 =~ s/^(\s*?\*?FRMR:.*?MastIdx:)\d+/$1 [IGNORED]/mi if ($rectype eq 'CELL');
-		my $cmprec1 = lc($print_rec1);
-		my $cmprec2 = lc($print_rec2);
-		if ($opt_diff_sortsubrecs) {
-		    $cmprec1 = join("\n", sort split(/\n/, $print_rec1));
-		    $cmprec2 = join("\n", sort split(/\n/, $print_rec2));
-		}
-		if ($cmprec1 eq $cmprec2) {
+		if ($print_rec1 eq $print_rec2) {
 		    push(@p1_equal_p2, "$rectype: $id") if ($opt_diff_equal);
 		} elsif ($opt_diff_not_equal) {
 		    push(@p1_diff_p2, "$rectype: $id");
@@ -8547,8 +7524,8 @@ sub cmd_diff {
 	foreach (sort @p1_equal_p2) { print "$_\n"; }
     }
     if ($opt_diff_not_equal) {
-	my $diff1_file = $plugin1 . "-diff.txt";
-	my $diff2_file = $plugin2 . "-diff.txt";
+    my $diff1_file = fileparse($plugin1) . "-diff.txt"; # get file basename
+    my $diff2_file = fileparse($plugin2) . "-diff.txt"; # get file basename
 	if (my $n = @p1_diff_p2) {
 	    print qq{\nRecords that are different between "$plugin1" and "$plugin2" ($n):\n(Compare $diff1_file to $diff2_file)\n};
 	    foreach (sort @p1_diff_p2) {
@@ -8557,7 +7534,6 @@ sub cmd_diff {
 	}
 	@diff1 = sort @diff1;
 	@diff2 = sort @diff2;
-	print "\n";
 	diff_output($diff1_file, \@diff1);
 	diff_output($diff2_file, \@diff2);
     }
@@ -8569,19 +7545,19 @@ sub cmd_delete {
     my $delete_subrecords = ($opt_sub_match or $opt_sub_no_match);
     my $delete_instances = ($opt_instance_match or $opt_instance_no_match);
     my $fun = sub {
-	my($rectype0, $tr0) = @_;
+	my($rectype0, $tr0, $wanted_ids, $wanted_types, $wanted_flags) = @_;
 	my($rec_match, $rectype, $tr, $print_rec) =
-	    rec_match($plugin, $rectype0, $tr0); # calls tr->decode()
+	    rec_match($plugin, $rectype0, $tr0, $wanted_ids, $wanted_types, $wanted_flags); # calls tr->decode()
 	# we pass through all records that did not match the standard record selection switches of rec_match
 	return('') unless ($rec_match);
 	my $id = $tr->id;
 	if ($delete_subrecords) {
-	    # we are processing subrecords
+	    # we are processing sub-records
 	    my @newtr;
 	    foreach my $tsr ($tr->subrecs()) {
 		my $subrec_str = $tsr->tostr;
 		my @deletion_msgs;
-		#((not $WANTED_TYPES) or ($WANTED_TYPES->{$tsr->subtype})) and  ## maybe something like this
+		#((not $wanted_types) or ($wanted_types->{$tsr->subtype})) and  ## maybe something like this
 		if (((not $opt_sub_match) or ($subrec_str =~ /$opt_sub_match/i)) and
 		    ((not $opt_sub_no_match) or ($subrec_str !~ /$opt_sub_no_match/i))) {
 		    print "[$rectype $id] DELETED SUBRECORD: $subrec_str\n";
@@ -8653,17 +7629,15 @@ sub cmd_modify {
     my($plugin) = @_;
     dbg("cmd_modify($plugin)") if (DBG);
     my $modify_subrecords = ($opt_sub_match or $opt_sub_no_match);
-    if (my $replacer = ($opt_modify_replace || $opt_modify_replacefirst)) {
+    if ($opt_modify_replace) {
 	# make the replacer case-insensitive
-	$replacer = qq{(?i)$replacer};
-	if (not $opt_modify_replacefirst) {
-	    # make the replacer global
-	    $replacer .= 'g';
-	}
+    $opt_modify_replace .= 'i';
+    # make the replacer global
+    $opt_modify_replace .= 'g';
 	# check that the replacer expression is valid
-	eval qq{(my \$foo = "HALCALI") =~ s$replacer;};
+    eval qq{(my \$foo = "HALCALI") =~ s$opt_modify_replace;};
 	if ($@) {
-	    abort("Invalid replacer expression: $replacer");
+	    abort("Invalid replacer expression: $opt_modify_replace");
 	}
     }
     my $fun = sub {
@@ -8686,7 +7660,8 @@ sub cmd_modify {
 		    $modified = 1 if (eval qq{\$tsr->{$key} =~ s$opt_modify_replace;});
 		}
 	    }
-	} elsif ($opt_modify_run) {
+    }
+    if ($opt_modify_run) {
 	    if ($modify_subrecords) {
 		# run modifying code only on matching subrecs
 		foreach my $tsr ($tr->subrecs()) {
@@ -8724,41 +7699,6 @@ sub cmd_modify {
     };
     process_plugin_for_update($plugin, $fun) or return(0);
 } # cmd_modify
-
-sub cmd_run {
-    my($plugin, $userfun) = @_;
-    dbg("cmd_run($plugin)") if (DBG);
-    $userfun = \&main unless($userfun); # function that processes each record
-    my $subrecords = ($opt_sub_match or $opt_sub_no_match);
-    my $fun = sub {
-	my($rec_match, $rectype, $tr, $print_rec) = rec_match($plugin, @_); # calls tr->decode()
-	# we pass through all records that did not match the standard record selection switches of rec_match
-	return unless ($rec_match);
-	my $id = $tr->id;
-	if ($subrecords) {
-	    # run code only on matching subrecs
-	    foreach my $tsr ($tr->subrecs()) {
-		if ($subrecords) {
-		    my $subrec_str = $tsr->tostr;
-		    next unless (((not $opt_sub_match) or ($subrec_str =~ /$opt_sub_match/i)) and
-				 ((not $opt_sub_no_match) or ($subrec_str !~ /$opt_sub_no_match/i)));
-		}
-		$userfun->($tr);	# user supplied the "main" subroutine
-		if ($@) {
-		    msg(qq{Error running "main()" on: $rectype ($@)});
-		}
-	    }
-	} else {
-	    # run modifying code on entire subrec
-	    $userfun->($tr);	# user supplied the "main" subroutine
-	    if ($@) {
-		msg(qq{Error running "main()" on: $rectype ($@)});
-	    }
-	}
-	return;
-    };
-    process_plugin_for_input($plugin, $fun) or return(0);
-} # cmd_run
 
 sub cmd_header {
     my($plugin) = @_;
@@ -8873,7 +7813,7 @@ sub cmd_clean {
 		dbg("examining GMST  ID=$id  TYPE=$type  FIELD=$field") if (DBG);
 		my $val_tsr = $plug_tr->get($type);
 		if ($val_tsr) {
-		    # we only process GMSTs that have associated value subrecords
+		    # we only process GMSTs that have associated value sub-records
 		    my $val = $val_tsr->subbuf;
 		    unless (defined $val) {
 			my $what = "GMST with no value";
@@ -8930,8 +7870,12 @@ sub cmd_clean {
 			push(@newcell, @this_group);
 		    } else {
 			my($plug_objidx, $plug_buf, $plug_objname) = buffalize(@this_group);
-		      CHECK_MASTER_INSTANCES:
-			foreach my $master (keys %{my_master}) {
+
+# begin abot+++
+# look for a last master editing the same object so it is different, if there is one keep it
+			my $dopcmi = 1;
+		      CHECK_MASTER_INSTANCES0:
+			foreach my $master (reverse keys %{my_master}) {
 			    next unless (defined $MASTER_ID->{$master}->{$id}->{$rectype});
 			    dbg("master=$master  CELL.ID=$id  DUMP=".Dumper($MASTER_ID->{$master}->{$id})) if (DBG);
 			    my($recbuf, $hdrflags) = @{$MASTER_ID->{$master}->{$id}->{CELL}};
@@ -8945,16 +7889,45 @@ sub cmd_clean {
 				    dbg("mgref=$mgref  DUMP=".Dumper($mgref)) if (DBG);
 				    my($mast_objidx, $mast_buf) = buffalize(@$mgref);
 				    if (defined($mast_objidx) and ($plug_objidx == $mast_objidx)) {
-					if ($plug_buf eq $mast_buf) {
-					    $cleaned++;
-					    $cell_modified++;
-					    last CHECK_MASTER_INSTANCES; # done with all masters
+					if ($plug_buf ne $mast_buf) {
+					    $dopcmi = 0;
+						last CHECK_MASTER_INSTANCES0; # done with all masters
 					}
 					last; # done with this master
 				    }
 				}
 			    }
 			}
+# end abot+++
+
+			if ($dopcmi == 1) { # abot+++
+				CHECK_MASTER_INSTANCES:
+				foreach my $master (keys %{my_master}) {
+					next unless (defined $MASTER_ID->{$master}->{$id}->{$rectype});
+					dbg("master=$master  CELL.ID=$id  DUMP=".Dumper($MASTER_ID->{$master}->{$id})) if (DBG);
+					my($recbuf, $hdrflags) = @{$MASTER_ID->{$master}->{$id}->{CELL}};
+					dbg("hdrflags=$hdrflags  recbuf=$recbuf") if (DBG);
+					if (my $mast_tr = TES3::Record->new_from_recbuf('CELL', $recbuf, $hdrflags)->decode()) {
+						dbg("master=$master mast_tr==".Dumper($mast_tr)) if (DBG);
+						my @master_groups = @{$mast_tr->split_groups()};
+						shift(@master_groups);  # skip header group
+						foreach my $mgref (@master_groups) {
+							next if ($mgref->[0]->subtype eq 'NAM0');
+							dbg("mgref=$mgref  DUMP=".Dumper($mgref)) if (DBG);
+							my($mast_objidx, $mast_buf) = buffalize(@$mgref);
+							if (defined($mast_objidx) and ($plug_objidx == $mast_objidx)) {
+								if ($plug_buf eq $mast_buf) {
+									$cleaned++;
+									$cell_modified++;
+									last CHECK_MASTER_INSTANCES; # done with all masters
+								}
+							last; # done with this master
+							}
+						}
+					}
+				}
+			} # abot+++
+
 			if ($cleaned) {
 			    my $what = "duplicate object instance";
 			    $stats{$what}++;
@@ -9094,18 +8067,9 @@ sub cmd_clean {
 sub cmd_dump {
     my($plugin) = @_;
     dbg("cmd_dump($plugin)") if (DBG);
-    my $dump_banner = ($opt_no_banner) ? "" : "\nPlugin: $plugin\n";
+    my $dump_banner;
+    $dump_banner = "\nPlugin: $plugin\n" unless ($opt_no_banner);
     my $match_instances = ($opt_instance_match or $opt_instance_no_match);
-    my @format_lines;
-    foreach (@opt_dump_format) {
-	my @format_fields;
-	my $line = $_;
-	$line =~ s/\%([^%]+)\%/\%s/g;
-	while (/\%([^%]+)\%/g) {
-	    push(@format_fields, $1);
-	}
-	push(@format_lines, [$line, @format_fields]);
-    }
     my $fun = sub {
 	my($rec_match, $rectype, $tr, $print_rec) = rec_match($plugin, @_); # calls tr->decode
 	return unless ($rec_match);
@@ -9122,33 +8086,11 @@ sub cmd_dump {
 		my $objcnt = (defined $tr->{SH}->{FRMR}) ? scalar(@{$tr->{SH}->{FRMR}}) : 0;
 		printf "$prefix $rectype: %-45s\t%5d objects\n", $id, $objcnt;
 	    } else {
-		my $fnam = $tr->get('FNAM');
-		my $fnamstr = defined($fnam->{name}) ? " (" . ($fnam->{name}) . ")" : "";
-		print "$prefix $rectype: $id$fnamstr\n";
+		print "$prefix $rectype: $id\n";
 	    }
 	};
-	if (@opt_dump_format) {
-	    my $output;
-	    foreach my $format (@format_lines) {
-		my @fmt = @$format;
-		my $line = shift(@fmt);
-		#print "DBG: line=$line formats=@fmt\n";
-		if ($opt_dump_no_quote) {
-		    printf "$line\n", map { $tr->getfield($_); } @fmt;
-		} else {
-		    my @vals;
-		    foreach my $field (@fmt) {
-			my $val = $tr->getfield($field);
-			if ($val =~ /\s/) {
-			    $val =~ s/\"/\\"/g; # quote embedded doublequotes
-			    $val = qq{"$val"};
-			}
-			push(@vals, $val);
-		    }
-		    printf "$line\n", @vals;
-		}
-	    }
-	} elsif ($opt_list) {
+    $print_rec ||= $tr->tostr;
+    if ($opt_list) {
 	    $list_record->();
 	} elsif ($match_instances) {
 	    my @groups = @{$tr->split_groups()};
@@ -9173,7 +8115,7 @@ sub cmd_dump {
 	    if ($selected) {
 		$nam0_tsr->{reference_count} = $n;	# update NAM0
 		my $newtr = CELL->new([@newcell]);
-		if ($opt_dump_binary) {
+		if ($opt_dump_raw) {
 		    $list_record->("Raw Output:");
 		    $newtr->write_rec($DUMP_RAWOUT);
 		} else {
@@ -9181,11 +8123,10 @@ sub cmd_dump {
 		}
 	    }
 	} else {
-	    if ($opt_dump_binary) {
+	    if ($opt_dump_raw) {
 		$list_record->("Raw Output:");
 		$tr->write_rec($DUMP_RAWOUT);
 	    } else {
-		$print_rec ||= $tr->tostr;
 		print "\n$print_rec\n" if ($print_rec);
 	    }
 	}
@@ -9353,29 +8294,59 @@ sub cmd_undelete {
 
 sub cmd_active {
     my(@plugins) = @_;
+	# we are either activating or deactivating plugins here
     my %active;
     my $n = 0;
     if ($opt_active_on or $opt_active_off) {
-	my $gamefiles = $T3->read_gamefiles();
-	my %gfiles = ();
-	$gfiles{lc $_} = $_ foreach (@$gamefiles);
-	if ($opt_active_on) {	# Activating given plugins
-	    foreach my $plug (@plugins) {
-		unless ($gfiles{lc $plug}) {
-		    prn("ACTIVATED: $plug");
-		    $gfiles{lc $plug} = $plug;
+    my $mwinipath = $T3->ini_file;
+    if (my $ini = Config::IniFiles->new( -file => $mwinipath )) {
+	    if ($opt_active_off) {
+		my %off = map { lc($_), 1 } (@plugins);
+		foreach my $param ($ini->Parameters('Game Files')) {
+		    my $plugin = $ini->val('Game Files', $param);
+		    if ($T3->datafile($plugin)) {
+			my $lc_plugin = lc($plugin);
+			dbg(qq{Found Gamefile: "$plugin"}) if (DBG);
+			if (defined $off{$lc_plugin}) {
+			    prn("DEACTIVATED: $plugin");
+			} else {
+			    $active{$lc_plugin} = $plugin;
+			}
+		    } else {
+			dbg(qq{MISSING Gamefile: "$1"}) if (DBG);
+		    }
+		    $ini->delval('Game Files', $param);
+		}
+	    } elsif ($opt_active_on) {
+		# add plugins user wants activated to active list if they exist in Data Files
+		foreach my $param ($ini->Parameters('Game Files')) {
+		    my $plugin = $ini->val('Game Files', $param);
+		    if ($T3->datafile($plugin)) {
+			dbg(qq{Found Gamefile: "$plugin"}) if (DBG);
+			$active{lc($plugin)} = $plugin;
+		    } else {
+			dbg(qq{MISSING Gamefile: "$1"}) if (DBG);
+		    }
+		    $ini->delval('Game Files', $param);
+		}
+		foreach my $plugin (@plugins) {
+		    if ($T3->datafile($plugin)) {
+			my $lc_plugin = lc($plugin);
+			dbg(qq{Found Gamefile: "$plugin"}) if (DBG);
+			unless (defined $active{$lc_plugin}) {
+			    prn("ACTIVATED: $plugin");
+			    $active{$plugin} = $plugin;
+			}
+		    } else {
+			err(qq{cmd_active(): $plugin not found in Data Files});
+            }
 		}
 	    }
-	} elsif ($opt_active_off) {	# De-Activating given plugins
-	    foreach my $plug (@plugins) {
-		if ($gfiles{lc $plug}) {
-		    prn("DEACTIVATED: $plug");
-		    delete $gfiles{lc $plug};
-		}
-	    }
+	    $ini->newval('Game Files', "GameFile".$n++, $_) foreach (sort values %active);
+	    $ini->RewriteConfig;
+	} else {
+	    abort("Failed to load INI file: ".$T3->ini_file."\nError: @Config::IniFiles::errors");
 	}
-	my @newgamefiles = sort values %gfiles;
-	$T3->write_gamefiles(\@newgamefiles);
     } else {
 	print "[LOAD ORDER]\n";
 	my $n = 0;
@@ -9396,40 +8367,16 @@ sub cmd_resetdates {
     }
 }
 
-sub minihelp {
-    die <<"EOF";
-Usage: tes3cmd COMMAND OPTIONS plugin...
-
-VERSION: $::VERSION
-
-tes3cmd is a utility for the Elder Scrolls game MORROWIND
-that can examine and modify plugin files in many ways.
-
-FOR MORE HELP, TYPE:
-
-tes3cmd help
-EOF
-}
-
 sub tes3cmd_main {
-    TES3::Util::find_morrowind();
+    TES3::Util::find_datadir();
     msg("ASSERTIONS ON!") if (ASSERT);
     my $cmd_name = (not defined($ARGV[0]) or $ARGV[0] =~ /^--/) ? '' : shift(@ARGV);
     $COMMAND{help}->{preprocess}()
 	if ((not defined($cmd_name)) or ($cmd_name =~ /help/i));
     my $cmd_ref = $COMMAND{$cmd_name};
-    if (not $cmd_ref) {
-	# check to see if user extension
-	my $extension;
-	if (-f $cmd_name) {
-	    $cmd_ref = load_perl($cmd_name);
-	} elsif (-f "${cmd_name}.pl") {
-	    $cmd_ref = load_perl("${cmd_name}.pl");
-	}
-    }
     dbg(qq{Command Selected: "$cmd_name"}) if (DBG);
-    minihelp()
-	unless ($cmd_ref);
+    $COMMAND{help}->{preprocess}()
+    unless ($cmd_ref = $COMMAND{$cmd_name});
     GetOptions(@{$cmd_ref->{options}}) or die($cmd_ref->{usage}."\n");
     # glob plugin names containing glob chars and remove ignored plugins
     my @plugins;
@@ -9441,30 +8388,10 @@ sub tes3cmd_main {
 	    push(@plugins, $plugin);
 	}
     }
-    if ($opt_active) {
-	my @load_order = $T3->load_order;;
-	if (@plugins) {
-	    # only process specified plugins if they are active
-	    my %lo = map {lc,1} @load_order;
-	    my @active;
-	    foreach my $plug (@plugins) {
-		push(@active, $plug) if ($lo{lc($plug)});
-	    }
-	    # sort input plugins by modification date
-	    @plugins = sort { (-M $b) <=> (-M $a) } @active;
-	} else {
-	    # process all active plugins
-	    @plugins = @load_order;
-	}
-    }
-    # when there's only one plugin, we don't need to print banners
-    $opt_no_banner = 1 if (scalar(@plugins) == 1);
     # if standard option --output-dir was used, ensure destination exists
     if ($opt_output_dir and not -d $opt_output_dir) {
 	mkpath($opt_output_dir, 0755) or abort("Unable to create directory: $opt_output_dir");
     }
-    # organize wanted record selectors
-    get_wanted();
     if (defined(my $pre = $cmd_ref->{preprocess})) {
 	# run the pre-process function
 	dbg("$cmd_name: Executing Pre-Process function") if (DBG);
@@ -9478,8 +8405,7 @@ sub tes3cmd_main {
 	foreach my $plugin (@plugins) {
 	    print "Processing: $plugin\n" if (VERBOSE);
 	    $CURRENT_PLUGIN = $plugin;
-	    $CURRENT_DIAL = undef; # reset
-	    #$FACT_I = 0;	  # reset
+        $CURRENT_DIAL = undef;
 	    $process->($plugin);
 	}
     }
